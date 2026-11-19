@@ -1,0 +1,48 @@
+---
+title: "Registration coordinates"
+author: "Asier Antoranz"
+output:
+  html_document:
+    df_print: paged
+---
+
+Summarizes the registered coordinates used for cross-modality analyses.
+
+**Inputs:** Coordinate manifests and registered coordinates in `paper_data/Registration`.
+
+**Outputs:** A coordinate inventory in `results/` for the Xenium–MILAN and Xenium–Visium analyses.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+```
+
+```{r load_libraries}
+
+library(dplyr)
+data_dir <- file.path(data_root, 'Registration')
+outdir <- file.path(output_root, 'Registration', 'results')
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+## Registered coordinates
+
+```{r coordinates}
+
+samples <- read.csv(file.path(data_dir, 'samples.csv'))
+summary <- lapply(seq_len(nrow(samples)), function(i) {
+  row <- samples[i, ]
+  coordinates <- read.csv(file.path(data_dir, row$file))
+  data.frame(workflow = row$workflow, sample_id = row$sample_id,
+             modality = row$modality, points = nrow(coordinates))
+})
+write.csv(bind_rows(summary), file.path(outdir, 'registered_coordinates.csv'), row.names = FALSE)
+
+```
+
