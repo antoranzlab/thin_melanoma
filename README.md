@@ -1,41 +1,40 @@
 # Thin melanoma spatial multi-omics
 
-Analysis notebooks for the thin melanoma study, covering Xenium spatial transcriptomics, MILAN protein measurements, Visium CytAssist and external bulk-transcriptomic survival cohorts.
+This project examines how melanoma-cell states and their tissue environments relate to metastatic outcome. Spatial profiling of thin primary melanomas identified seven metaprograms organized along two inferred trajectories, with further evaluation in independent primary-melanoma cohorts.
 
-## Contents and execution order
+## Data modalities
 
-- **Xenium:** run notebooks 01–06 in order for quality control, broad-lineage annotation, melanoma metaprograms and trajectories, cell subtypes, combined annotations, spatial composition and signature comparisons.
-- **MILAN:** run 01, then 02 after Xenium 04. These notebooks match registered cells and compare RNA and protein profiles.
-- **Visium:** run 01, then 02 and 04 after Xenium 04. These notebooks cover preprocessing, metaprogram and trajectory projection, gene/pathway analyses and technical validation. The former notebook 03 was integrated into 01–02; the remaining filenames retain their numbering.
-- **Public_cohorts:** survival analysis of the nevus-like signature in Leeds and GSE98394.
-- **Registration:** summarizes prepared registered coordinates. Raw-image registration with VALIS is not included in this snapshot.
+- **Xenium:** targeted single-cell spatial RNA measurements.
+- **MILAN:** multiplex immunofluorescence protein measurements, matched to Xenium cells from the same section.
+- **Visium CytAssist:** broader spatial gene-expression profiles from corresponding sections.
+- **H&E:** image-inferred expression for independent histological validation; this workflow is not yet included here.
+- **Bulk transcriptomics:** external primary-melanoma cohorts for survival analyses.
 
-Each notebook lists its inputs and outputs. Shared functions are in `Xenium/helpers.R` and `Visium/helpers.R`.
+## Repository structure
 
-## Data and paths
+Notebooks are grouped by modality and numbered in execution order. Each contains its inputs, outputs, analyses and associated figures.
 
-This repository contains code only. Raw data, patient metadata, prepared inputs, analysis objects and generated figures are not included. Execution requires the corresponding inputs; the notebooks are not self-contained examples.
+| Script | Purpose |
+|---|---|
+| [Xenium/01](Xenium/01_Xenium_QC_normalization_level1_clustering.Rmd) | Import, quality control, normalization and broad-lineage annotation. |
+| [Xenium/02](Xenium/02_Xenium_metaprogrammes_trajectories.Rmd) | Identify melanoma metaprograms and infer diffusion-map/Slingshot trajectories. |
+| [Xenium/03](Xenium/03_Xenium_cell_subtypes.Rmd) | Annotate non-melanoma cell subtypes. |
+| [Xenium/04](Xenium/04_Xenium_combined_annotations.Rmd) | Combine annotations and project reassigned melanoma cells. |
+| [Xenium/05](Xenium/05_Xenium_spatial_composition.Rmd) | Analyze cell composition, acquisition concordance, neighborhoods and epidermal depth. |
+| [Xenium/06](Xenium/06_Xenium_markers_signatures.Rmd) | Identify markers and compare public signatures and the Kunz cohort. |
+| [MILAN/01](MILAN/01_MILAN_matching_protein_profiles.Rmd) | Match Xenium–MILAN cells and summarize protein profiles and lineage concordance. |
+| [MILAN/02](MILAN/02_MILAN_RNA_protein_spatial.Rmd) | Compare RNA and protein measurements across space and trajectories. |
+| [Visium/01](Visium/01_Visium_preprocessing_trajectories.Rmd) | Preprocess/integrate expression and project metaprograms and trajectories. |
+| [Visium/02](Visium/02_Visium_gene_pathway_analysis.Rmd) | Compare genes and Hallmark pathways and model pseudotime trends. |
+| [Visium/04](Visium/04_Visium_registration_validation.Rmd) | Evaluate registered Xenium pseudospots, imputation and melanoma-spot selection. |
+| [Public_cohorts/01](Public_cohorts/01_Public_cohorts_survival.Rmd) | Test nevus-like scores against survival in Leeds and GSE98394. |
+| [Registration/01](Registration/01_Registration_coordinates.Rmd) | Summarize prepared registered coordinates; does not perform image registration. |
+| [Xenium/helpers.R](Xenium/helpers.R), [Visium/helpers.R](Visium/helpers.R) | Functions shared between notebooks. |
 
-Set the root folders in the first setup chunk of each notebook:
+Run Xenium 01–06 first, then MILAN 01–02 and Visium 01, 02 and 04. Visium 03 was incorporated into 01–02. Public-cohort analyses use the prepared Xenium signatures.
 
-```r
-data_root <- 'path_to_input'
-output_root <- 'path_to_output'
-code_root <- 'path_to_code'
-```
+## Running the code
 
-Replace the placeholders with your input-data folder, output folder and downloaded repository folder. `code_root` is included where helper imports or the knitting working directory require it. Use the same roots across notebooks. Modality subfolders and cross-modality paths are constructed automatically with `file.path()`; generated outputs are separate from the source code.
+Data are supplied separately. Set `data_root <- 'path_to_input'`, `output_root <- 'path_to_output'` and, where present, `code_root <- 'path_to_code'` in each notebook's setup chunk. All remaining paths are built automatically. Install the R packages loaded in the notebooks; Visium imputation also uses Python through reticulate.
 
-The input folder should contain `Xenium`, `MILAN`, `Visium`, `Public_cohorts` and `Registration` subfolders, following the inputs described in each notebook. The code folder contains the corresponding notebook/helper folders. Outputs are written beneath the output root in modality subfolders.
-
-Submitted input data use the final descriptive filenames expected by the notebooks; no filename migration is required.
-
-Rebuild the main analysis objects with these notebooks before using their downstream readers. Visium 01 saves a final `visium_analysis.rds` and retains costly SCT and MAGIC checkpoints; Xenium 02 retains its diffusion-map and Slingshot models within `melanoma_analysis.rds`.
-
-## Software
-
-Use R with R Markdown/knitr and the packages loaded in each notebook. Core dependencies include Seurat, tidyverse, Matrix, destiny, slingshot, SingleR, GSVA, tradeSeq, mgcv, limma, speckle and survival. Some steps additionally require the Python environment accessed through reticulate. Prepared cell2location weights are inputs rather than newly fitted by these notebooks. A pinned software environment is not included in this snapshot.
-
-## Verification status
-
-The curated R code has passed syntax checks and selected small-data tests during reorganization. The full revised pipeline has not yet been run end to end on the study data. Code-generated figure layouts may differ from the manually edited manuscript figures.
+Syntax and selected small-data tests have passed; full execution of the revised pipeline on the study data remains pending.
