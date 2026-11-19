@@ -16,11 +16,11 @@ library(tidyr)
 library(png)
 
 config <- fromJSON('config.json')
-config$workspace <- file.path(config$workspace, 'virtualHE')
-config$output <- file.path(config$output, 'virtualHE')
-data_dir <- file.path(config$output, 'data')
-result_dir <- file.path(config$output, 'results')
-figure_dir <- file.path(config$output, 'figures')
+input_dir <- file.path(config$workspace, 'virtualHE')
+outdir <- file.path(config$output, 'virtualHE')
+data_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+figure_dir <- file.path(outdir, 'figures')
 for (path in c(result_dir, figure_dir)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
 ```
 
@@ -37,8 +37,8 @@ rm(values)
 features <- lapply(schema$signatures, intersect, y = schema$genes)
 
 # Select expression-matched control genes without using outcome labels.
-reference <- CreateSeuratObject(counts = CreateAssayObject(data = expression[, seq_len(schema$n_fit)]), assay = 'RNA')
-reference <- AddModuleScore(reference, features = features, pool = schema$genes, ctrl = 5, nbin = 10, seed = 20260805, name = 'AMS', slot = 'data')
+reference <- CreateSeuratObject(counts = CreateAssayObject(data = expression[, seq_len(schema$n_fit)]), assay = 'RNA') %>%
+  AddModuleScore(features = features, pool = schema$genes, ctrl = 5, nbin = 10, seed = 20260805, name = 'AMS', slot = 'data')
 controls <- fromJSON('inputs/metaprogram_controls.json')
 scores <- sapply(seq_along(features), function(i) {
   Matrix::colMeans(expression[features[[i]], , drop = FALSE]) - Matrix::colMeans(expression[controls$controls[[i]], , drop = FALSE])
@@ -54,21 +54,25 @@ gc()
 ## Patient-level fractions
 
 ```{r patient_fractions}
-cohort <- read.csv(file.path(config$workspace, 'inputs', 'cohort.csv'))
+cohort <- read.csv(file.path(input_dir, 'inputs', 'cohort.csv'))
 stopifnot(nrow(cohort) == 60, length(unique(cohort$clinical_unit_key)) == 58)
 counts <- table(factor(spots$slide, levels = cohort$slide), factor(spots$metaprogram, levels = names(features)))
-slides <- cbind(cohort, as.data.frame.matrix(counts))
-slides$n_tumor <- rowSums(counts)
-slides$n_mes <- slides$mesenchymal_invasive
-slides$n_nevus <- slides$nevus_like_senescence
-slides$mes_fraction <- slides$n_mes / slides$n_tumor
-slides$nevus_fraction <- slides$n_nevus / slides$n_tumor
-slides$ratio <- slides$n_mes / slides$n_nevus
+slides <- cbind(cohort, as.data.frame.matrix(counts)) %>%
+  mutate(
+    n_tumor = unname(rowSums(counts)),
+    n_mes = mesenchymal_invasive,
+    n_nevus = nevus_like_senescence,
+    mes_fraction = n_mes / n_tumor,
+    nevus_fraction = n_nevus / n_tumor,
+    ratio = n_mes / n_nevus
+  )
 write.csv(slides, file.path(result_dir, 'slide_fractions.csv'), row.names = FALSE)
-patients <- aggregate(cbind(n_tumor, n_mes, n_nevus) ~ clinical_unit_key + outcome, slides, sum)
-patients$mes_fraction <- patients$n_mes / patients$n_tumor
-patients$nevus_fraction <- patients$n_nevus / patients$n_tumor
-patients$ratio <- patients$n_mes / patients$n_nevus
+patients <- aggregate(cbind(n_tumor, n_mes, n_nevus) ~ clinical_unit_key + outcome, slides, sum) %>%
+  mutate(
+    mes_fraction = n_mes / n_tumor,
+    nevus_fraction = n_nevus / n_tumor,
+    ratio = n_mes / n_nevus
+  )
 stopifnot(nrow(patients) == 58, sum(patients$outcome == 'met') == 35, all(is.finite(patients$ratio)))
 write.csv(patients, file.path(result_dir, 'patient_fractions.csv'), row.names = FALSE)
 ```
@@ -89,9 +93,9 @@ results <- lapply(c('mes_fraction', 'nevus_fraction', 'ratio'), function(feature
   data.frame(feature = feature, auc = auc(value[positive], value[negative]), ci_low = ci[1], ci_high = ci[2],
              median_met = median(raw[positive]), median_nmet = median(raw[negative]),
              p = wilcox.test(raw[positive], raw[negative], exact = FALSE)$p.value)
-})
-results <- bind_rows(results)
-results$FDR <- p.adjust(results$p, 'BH')
+}) %>%
+  bind_rows() %>%
+  mutate(FDR = p.adjust(p, 'BH'))
 write.csv(results, file.path(result_dir, 'association_results.csv'), row.names = FALSE)
 print(results)
 ```
@@ -106,8 +110,9 @@ save_panel <- function(plot, name, width, height) {
   ggsave(file.path(figure_dir, paste0(name, '.pdf')), plot, width = width, height = height, device = cairo_pdf)
   ggsave(file.path(figure_dir, paste0(name, '.png')), plot, width = width, height = height, dpi = 600)
 }
-long <- pivot_longer(patients, c(nevus_fraction, mes_fraction), names_to = 'programme', values_to = 'fraction')
-long$programme <- factor(long$programme, levels = c('nevus_fraction', 'mes_fraction'), labels = c('Nevus-like', 'Mesenchymal-invasive'))
+long <- patients %>%
+  pivot_longer(c(nevus_fraction, mes_fraction), names_to = 'programme', values_to = 'fraction') %>%
+  mutate(programme = factor(programme, levels = c('nevus_fraction', 'mes_fraction'), labels = c('Nevus-like', 'Mesenchymal-invasive')))
 p <- ggplot(long, aes(outcome, fraction, colour = outcome)) + geom_boxplot(outlier.shape = NA, width = 0.5) +
   geom_point(position = position_jitter(width = 0.12, height = 0, seed = 42), size = 1.8) + facet_wrap(~programme) +
   scale_colour_manual(values = colours) + scale_x_discrete(labels = c(nmet = 'M−', met = 'M+')) +
@@ -134,7 +139,7 @@ save_panel(p, 'Figure_5E_ROC', 4, 3.5)
 ## Figure 5B: spatial examples
 
 ```{r spatial_examples}
-image_dir <- file.path(config$workspace, 'outputs/manuscript_figure')
+image_dir <- file.path(input_dir, 'outputs/manuscript_figure')
 regions <- read.csv(file.path(image_dir, 'regions.csv'))
 palette <- c(mesenchymal_invasive = '#FFC0CB', nevus_like_senescence = '#D55E00', other = '#800020')
 for (i in seq_len(nrow(regions))) {
@@ -143,15 +148,16 @@ for (i in seq_len(nrow(regions))) {
   padding <- apply(image[, , 1:3, drop = FALSE], c(1, 2), max) <= 1 / 255
   image <- image^0.70
   for (channel in 1:3) image[, , channel][padding] <- 1
-  selected <- subset(spots, slide == region$slide & x >= region$x0 & x <= region$x1 & y >= region$y0 & y <= region$y1)
-  selected$category <- ifelse(selected$metaprogram %in% names(palette), selected$metaprogram, 'other')
+  selected <- spots %>%
+    filter(slide == region$slide & x >= region$x0 & x <= region$x1 & y >= region$y0 & y <= region$y1) %>%
+    mutate(category = ifelse(metaprogram %in% names(palette), metaprogram, 'other'))
+  xbar <- region$x0 + 0.08 * (region$x1 - region$x0)
+  ybar <- -region$y1 + 0.08 * (region$y1 - region$y0)
   p <- ggplot() + annotation_raster(image, region$x0, region$x1, -region$y1, -region$y0) +
     geom_point(data = selected, aes(x, -y, colour = category), size = 1.3, alpha = 0.85) +
     scale_colour_manual(values = palette) + coord_fixed(xlim = c(region$x0, region$x1), ylim = c(-region$y1, -region$y0), expand = FALSE) +
-    theme_void() + theme(legend.position = 'none')
-  xbar <- region$x0 + 0.08 * (region$x1 - region$x0)
-  ybar <- -region$y1 + 0.08 * (region$y1 - region$y0)
-  p <- p + annotate('segment', x = xbar, xend = xbar + 200 / region$mpp, y = ybar, yend = ybar, linewidth = 1) +
+    theme_void() + theme(legend.position = 'none') +
+    annotate('segment', x = xbar, xend = xbar + 200 / region$mpp, y = ybar, yend = ybar, linewidth = 1) +
     annotate('text', x = xbar + 100 / region$mpp, y = ybar + 0.05 * (region$y1 - region$y0), label = '200 µm', size = 4)
   save_panel(p, paste0('Figure_5B_', region$slide), 5, 4)
 }
