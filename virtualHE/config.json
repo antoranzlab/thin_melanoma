@@ -1,0 +1,26 @@
+{
+  "workspace": "path_to_input",
+  "output": "path_to_output",
+  "model": "models/DeepSpotM",
+  "checkpoints": [
+    "models/decoder_fold_1.pt",
+    "models/decoder_fold_2.pt",
+    "models/decoder_fold_3.pt",
+    "models/decoder_fold_4.pt",
+    "models/decoder_fold_5.pt",
+    "models/decoder_fold_6.pt"
+  ],
+  "marker_genes": [
+    "TYR",
+    "MLANA",
+    "PMEL",
+    "NSG1",
+    "EDNRB",
+    "MITF",
+    "TYRP1",
+    "QPCT",
+    "PCDH7",
+    "TFAP2A"
+  ],
+  "threshold": 0.9042399525642395
+}

@@ -1,0 +1,169 @@
+---
+title: "H&E metaprograms and metastatic outcome"
+author: "Asier Antoranz"
+output: html_document
+---
+
+Score the seven melanoma metaprograms in H&E-derived expression predictions, summarize their abundance per patient and test their association with metastatic outcome. Run `02_prepare_expression.ipynb` first.
+
+```{r load_libraries}
+library(Seurat)
+library(Matrix)
+library(jsonlite)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(png)
+
+config <- fromJSON('config.json')
+config$workspace <- file.path(config$workspace, 'virtualHE')
+config$output <- file.path(config$output, 'virtualHE')
+data_dir <- file.path(config$output, 'data')
+result_dir <- file.path(config$output, 'results')
+figure_dir <- file.path(config$output, 'figures')
+for (path in c(result_dir, figure_dir)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Metaprogram scores
+
+```{r score_metaprogrammes}
+schema <- fromJSON(file.path(data_dir, 'schema.json'))
+spots <- read.csv(file.path(data_dir, 'spots.csv.gz'))
+connection <- gzfile(file.path(data_dir, 'expression.bin.gz'), 'rb')
+values <- readBin(connection, numeric(), n = schema$n_spots * length(schema$genes), size = 4, endian = 'little')
+close(connection)
+expression <- matrix(values, nrow = length(schema$genes), dimnames = list(schema$genes, paste0('S', seq_len(schema$n_spots))))
+rm(values)
+features <- lapply(schema$signatures, intersect, y = schema$genes)
+
+# Select expression-matched control genes without using outcome labels.
+reference <- CreateSeuratObject(counts = CreateAssayObject(data = expression[, seq_len(schema$n_fit)]), assay = 'RNA')
+reference <- AddModuleScore(reference, features = features, pool = schema$genes, ctrl = 5, nbin = 10, seed = 20260805, name = 'AMS', slot = 'data')
+controls <- fromJSON('inputs/metaprogram_controls.json')
+scores <- sapply(seq_along(features), function(i) {
+  Matrix::colMeans(expression[features[[i]], , drop = FALSE]) - Matrix::colMeans(expression[controls$controls[[i]], , drop = FALSE])
+})
+colnames(scores) <- names(features)
+stopifnot(max(abs(scores[seq_len(schema$n_fit), ] - as.matrix(reference[[]][paste0('AMS', seq_along(features))]))) < 1e-12)
+spots$metaprogram <- colnames(scores)[max.col(scores, ties.method = 'first')]
+saveRDS(list(spots = spots, scores = scores), file.path(data_dir, 'metaprogram_scores.rds'))
+rm(reference, expression)
+gc()
+```
+
+## Patient-level fractions
+
+```{r patient_fractions}
+cohort <- read.csv(file.path(config$workspace, 'inputs', 'cohort.csv'))
+stopifnot(nrow(cohort) == 60, length(unique(cohort$clinical_unit_key)) == 58)
+counts <- table(factor(spots$slide, levels = cohort$slide), factor(spots$metaprogram, levels = names(features)))
+slides <- cbind(cohort, as.data.frame.matrix(counts))
+slides$n_tumor <- rowSums(counts)
+slides$n_mes <- slides$mesenchymal_invasive
+slides$n_nevus <- slides$nevus_like_senescence
+slides$mes_fraction <- slides$n_mes / slides$n_tumor
+slides$nevus_fraction <- slides$n_nevus / slides$n_tumor
+slides$ratio <- slides$n_mes / slides$n_nevus
+write.csv(slides, file.path(result_dir, 'slide_fractions.csv'), row.names = FALSE)
+patients <- aggregate(cbind(n_tumor, n_mes, n_nevus) ~ clinical_unit_key + outcome, slides, sum)
+patients$mes_fraction <- patients$n_mes / patients$n_tumor
+patients$nevus_fraction <- patients$n_nevus / patients$n_tumor
+patients$ratio <- patients$n_mes / patients$n_nevus
+stopifnot(nrow(patients) == 58, sum(patients$outcome == 'met') == 35, all(is.finite(patients$ratio)))
+write.csv(patients, file.path(result_dir, 'patient_fractions.csv'), row.names = FALSE)
+```
+
+```{r outcome_associations}
+auc <- function(a, b) mean(outer(a, b, '>') + 0.5 * outer(a, b, '=='))
+results <- lapply(c('mes_fraction', 'nevus_fraction', 'ratio'), function(feature) {
+  raw <- patients[[feature]]
+  value <- raw * ifelse(feature == 'nevus_fraction', -1, 1)
+  positive <- which(patients$outcome == 'met')
+  negative <- which(patients$outcome == 'nmet')
+  ci <- c(NA, NA)
+  if (feature == 'ratio') {
+    set.seed(20260922)
+    bootstrap <- replicate(5000, auc(value[sample(positive, length(positive), TRUE)], value[sample(negative, length(negative), TRUE)]))
+    ci <- quantile(bootstrap, c(0.025, 0.975))
+  }
+  data.frame(feature = feature, auc = auc(value[positive], value[negative]), ci_low = ci[1], ci_high = ci[2],
+             median_met = median(raw[positive]), median_nmet = median(raw[negative]),
+             p = wilcox.test(raw[positive], raw[negative], exact = FALSE)$p.value)
+})
+results <- bind_rows(results)
+results$FDR <- p.adjust(results$p, 'BH')
+write.csv(results, file.path(result_dir, 'association_results.csv'), row.names = FALSE)
+print(results)
+```
+
+## Figure 5C–E
+
+```{r outcome_figures}
+colours <- c(nmet = '#008570', met = '#6B3FA0')
+patients$outcome <- factor(patients$outcome, levels = c('nmet', 'met'))
+theme_set(theme_classic(base_size = 11))
+save_panel <- function(plot, name, width, height) {
+  ggsave(file.path(figure_dir, paste0(name, '.pdf')), plot, width = width, height = height, device = cairo_pdf)
+  ggsave(file.path(figure_dir, paste0(name, '.png')), plot, width = width, height = height, dpi = 600)
+}
+long <- pivot_longer(patients, c(nevus_fraction, mes_fraction), names_to = 'programme', values_to = 'fraction')
+long$programme <- factor(long$programme, levels = c('nevus_fraction', 'mes_fraction'), labels = c('Nevus-like', 'Mesenchymal-invasive'))
+p <- ggplot(long, aes(outcome, fraction, colour = outcome)) + geom_boxplot(outlier.shape = NA, width = 0.5) +
+  geom_point(position = position_jitter(width = 0.12, height = 0, seed = 42), size = 1.8) + facet_wrap(~programme) +
+  scale_colour_manual(values = colours) + scale_x_discrete(labels = c(nmet = 'M−', met = 'M+')) +
+  scale_y_continuous(labels = scales::label_percent()) + labs(x = NULL, y = 'Fraction of melanoma-enriched spots') + theme(legend.position = 'none')
+save_panel(p, 'Figure_5C_metaprogram_fractions', 5.5, 3.5)
+p <- ggplot(patients, aes(nevus_fraction, mes_fraction, colour = outcome)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = 'grey60') + geom_point(size = 2) +
+  scale_colour_manual(values = colours, labels = c('M−', 'M+')) +
+  scale_x_continuous(labels = scales::label_percent()) + scale_y_continuous(labels = scales::label_percent()) +
+  labs(x = 'Nevus-like fraction', y = 'Mesenchymal-invasive fraction', colour = NULL)
+save_panel(p, 'Figure_5D_joint_fractions', 4.2, 3.5)
+thresholds <- c(Inf, sort(unique(patients$ratio), decreasing = TRUE), -Inf)
+roc <- data.frame(fpr = sapply(thresholds, function(t) mean(patients$ratio[patients$outcome == 'nmet'] >= t)),
+                  tpr = sapply(thresholds, function(t) mean(patients$ratio[patients$outcome == 'met'] >= t)))
+write.csv(roc, file.path(result_dir, 'roc.csv'), row.names = FALSE)
+result <- subset(results, feature == 'ratio')
+p <- ggplot(roc, aes(fpr, tpr)) + geom_abline(slope = 1, intercept = 0, linetype = 2, colour = 'grey70') +
+  geom_path(colour = colours['met'], linewidth = 0.8) + coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  annotate('text', x = 0.98, y = 0.12, hjust = 1, label = sprintf('AUC %.3f\n95%% CI %.3f–%.3f', result$auc, result$ci_low, result$ci_high)) +
+  labs(x = 'False-positive rate', y = 'True-positive rate')
+save_panel(p, 'Figure_5E_ROC', 4, 3.5)
+```
+
+## Figure 5B: spatial examples
+
+```{r spatial_examples}
+image_dir <- file.path(config$workspace, 'outputs/manuscript_figure')
+regions <- read.csv(file.path(image_dir, 'regions.csv'))
+palette <- c(mesenchymal_invasive = '#FFC0CB', nevus_like_senescence = '#D55E00', other = '#800020')
+for (i in seq_len(nrow(regions))) {
+  region <- regions[i, ]
+  image <- readPNG(file.path(image_dir, 'assets', paste0(region$slide, '_region.png')))
+  padding <- apply(image[, , 1:3, drop = FALSE], c(1, 2), max) <= 1 / 255
+  image <- image^0.70
+  for (channel in 1:3) image[, , channel][padding] <- 1
+  selected <- subset(spots, slide == region$slide & x >= region$x0 & x <= region$x1 & y >= region$y0 & y <= region$y1)
+  selected$category <- ifelse(selected$metaprogram %in% names(palette), selected$metaprogram, 'other')
+  p <- ggplot() + annotation_raster(image, region$x0, region$x1, -region$y1, -region$y0) +
+    geom_point(data = selected, aes(x, -y, colour = category), size = 1.3, alpha = 0.85) +
+    scale_colour_manual(values = palette) + coord_fixed(xlim = c(region$x0, region$x1), ylim = c(-region$y1, -region$y0), expand = FALSE) +
+    theme_void() + theme(legend.position = 'none')
+  xbar <- region$x0 + 0.08 * (region$x1 - region$x0)
+  ybar <- -region$y1 + 0.08 * (region$y1 - region$y0)
+  p <- p + annotate('segment', x = xbar, xend = xbar + 200 / region$mpp, y = ybar, yend = ybar, linewidth = 1) +
+    annotate('text', x = xbar + 100 / region$mpp, y = ybar + 0.05 * (region$y1 - region$y0), label = '200 µm', size = 4)
+  save_panel(p, paste0('Figure_5B_', region$slide), 5, 4)
+}
+```
+
+## Figure 5A: workflow
+
+```{r prediction_workflow}
+workflow <- data.frame(x = 1:5, label = c('H&E image', 'DeepSpot-M\n257 genes', 'Melanoma-enriched\nspots', 'Seven competing\nmetaprogrammes', '58 patients\nFractions and ROC'))
+p <- ggplot(workflow, aes(x, 1)) + geom_label(aes(label = label), fill = '#F5F0F7', size = 3.2, label.padding = grid::unit(0.35, 'lines')) +
+  geom_segment(data = data.frame(x = 1:4), aes(x = x + 0.27, xend = x + 0.73, y = 1, yend = 1), inherit.aes = FALSE,
+               arrow = grid::arrow(length = grid::unit(0.12, 'inches'))) +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(0.5, 1.5), clip = 'off') + theme_void()
+save_panel(p, 'Figure_5A_workflow', 11, 1.5)
+```
