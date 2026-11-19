@@ -1,0 +1,516 @@
+---
+title: "MILAN RNA protein spatial"
+author: "Asier Antoranz"
+output:
+  html_document:
+    df_print: paged
+---
+
+Compares matched RNA and protein measurements across cells, tissue regions and melanoma trajectories.
+
+**Inputs:** Matched cells and protein profiles from MILAN notebook 01; Xenium counts and final annotations from notebooks 01 and 04; registered coordinates and selected-region definitions in `paper_data/Registration/MILAN` and `paper_data/MILAN/inputs`.
+
+**Outputs:** Matched expression and selected-region cell tables in `data/`; correlation, trajectory and spatial-enrichment summaries in `results/`; RNA–protein and lineage-concordance panels in `figures/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(data.table)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+
+outdir <- file.path(output_root, 'MILAN')
+input_dir <- file.path(data_root, 'MILAN', 'inputs')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+figure_dir <- file.path(outdir, 'figures')
+xenium_dir <- file.path(output_root, 'Xenium', 'data')
+for (path in c(outdir, intermediate_dir, result_dir, figure_dir)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+future::plan('sequential')
+registration_dir <- file.path(data_root, 'Registration', 'MILAN')
+matches_file <- file.path(intermediate_dir, 'xenium_milan_matches.csv')
+samples <- read.csv(file.path(input_dir, 'samples.csv'), colClasses = 'character')
+samples$scene <- samples$sample_id
+
+```
+
+## RNA and protein profiles
+
+```{r load_matched_proteins}
+
+matched <- readRDS(file.path(intermediate_dir, 'matched_cells_with_markers.rds'))
+marker_genes <- list(MELANA = 'MLANA', MITF = 'MITF', S100B = 'S100B', AQP1 = 'AQP1', CK = c('KRT5', 'KRT15', 'KRT18'), Ki67 = 'MKI67')
+
+```
+
+```{r normalize_matched_rna}
+
+input <- readRDS(file.path(xenium_dir, 'counts_qc.rds'))
+index <- match(matched$xenium_id, colnames(input$counts))
+counts <- as.matrix(input$counts[unique(unlist(marker_genes)), index, drop = FALSE])
+mlana_counts <- input$counts['MLANA', , drop = FALSE]
+rna <- log1p(sweep(counts, 2, input$metadata$nCount_Xenium[index], '/') * input$scale_factor)
+rm(input)
+gc()
+
+```
+
+```{r correlate_rna_protein}
+
+paired <- bind_rows(lapply(names(marker_genes), function(marker) {
+    x <- matched %>% select(sample_id, patient, milan_id, xenium_id, melanoma_mp_labels, pt_class, pt_merged)
+    x$marker <- marker
+    x$RNA <- colMeans(rna[marker_genes[[marker]], , drop = FALSE])
+    x$protein <- matched[[marker]]
+    x
+}))
+correlations <- paired %>% group_by(marker) %>% summarise(n_cells = n(), pearson_r = cor(RNA, protein), .groups = 'drop')
+patient_correlations <- paired %>% group_by(patient, marker) %>% summarise(n_cells = n(), pearson_r = cor(RNA, protein), .groups = 'drop')
+
+```
+
+```{r summarize_trajectory_profiles}
+
+paired <- paired %>% left_join(matched %>% select(sample_id, milan_id, pt_route1, pt_route2), by = c('sample_id', 'milan_id'), relationship = 'many-to-one')
+profiles <- bind_rows(lapply(1:2, function(route) {
+    excluded <- paste("Lineage", 3 - route)
+    x <- paired %>% filter(melanoma_mp_labels != "Non.Melanoma", pt_class != excluded) %>% group_by(marker) %>% 
+        mutate(RNA = as.numeric(scale(RNA)), protein = as.numeric(scale(protein))) %>% ungroup()
+    x$pt_bin <- round(x[[paste0("pt_route", route)]], 3)
+    x %>% group_by(marker, pt_bin) %>% summarise(n_cells = n(), RNA = mean(RNA), protein = mean(protein), .groups = "drop") %>% 
+        pivot_longer(c(RNA, protein), names_to = "feature", values_to = "value") %>% mutate(route = route)
+}))
+
+```
+
+```{r export_rna_protein_results}
+
+saveRDS(paired, file.path(intermediate_dir, "RNA_protein_matched_cells.rds"))
+write.csv(correlations, file.path(result_dir, "RNA_protein_correlations.csv"), row.names = FALSE)
+write.csv(patient_correlations, file.path(result_dir, "RNA_protein_correlations_by_patient.csv"), row.names = FALSE)
+write.csv(profiles, file.path(result_dir, "RNA_protein_trajectory_profiles.csv"), row.names = FALSE)
+
+```
+
+## RNA and protein along each trajectory
+
+```{r plot_trajectory_profiles}
+
+for (lineage in 1:2) {
+    data <- profiles %>% filter(route == lineage)
+    p <- ggplot(data, aes(pt_bin, value, color = feature)) + geom_hline(yintercept = 0, color = "grey75", linewidth = 0.35) +
+      geom_vline(xintercept = 0.056, color = "grey75", linewidth = 0.35) + geom_smooth() + geom_point(size = 0.8, 
+        alpha = 0.7) +
+      facet_wrap(~marker, nrow = 1, scales = "free_y") + scale_color_manual(values = c(RNA = "#0072B2", 
+        protein = "#D55E00"), name = NULL) +
+      labs(x = paste("Lineage", lineage, "pseudotime"), y = "Mean within-marker z-score") + theme_classic(base_size = 11) +
+      theme(strip.background = element_rect(fill = "grey94", color = NA), strip.text = element_text(face = "bold"), 
+        panel.spacing = grid::unit(0.8, "lines"), legend.position = "top")
+    ggsave(file.path(figure_dir, paste0("Figure_3J_lineage_", lineage, ".pdf")), p, width = 14, height = 3)
+}
+
+```
+
+## MLANA spatial enrichment
+
+```{r prepare_mlana_panels}
+
+library(patchwork)
+
+```
+
+```{r load_accepted_matches}
+
+df_matches <- fread(matches_file, colClasses = list(character = "milan_id"), data.table = FALSE) %>%
+  filter(accepted)
+
+```
+
+```{r assemble_mlana_measurements}
+
+sample_i <- "thinmme003_2"
+patient_id <- "thinmme003"
+mlana_numeric <- function(x) {
+    as.numeric(gsub(",", ".", as.character(x), fixed = TRUE))
+}
+tmp_milan <- read.csv(file.path(registration_dir, sample_i, "milan_cells.csv"), stringsAsFactors = FALSE) %>%
+  transmute(milan_id = as.character(OID), raw_MFI = mlana_numeric(MELANA), milan_x = mlana_numeric(x_registered), milan_y = mlana_numeric(y_registered))
+tmp_xenium <- read.csv(file.path(registration_dir, sample_i, "xenium_cells.csv"), stringsAsFactors = FALSE) %>%
+  transmute(xenium_id = as.character(cell), xenium_x = mlana_numeric(x_registered), xenium_y = mlana_numeric(y_registered))
+mlana_pairs <- df_matches %>% filter(sample_id == sample_i) %>%
+  transmute(milan_id = as.character(milan_id), xenium_id = as.character(xenium_id))
+metadata <- readRDS(file.path(xenium_dir, "final_annotation.rds"))
+ids <- intersect(mlana_pairs$xenium_id, colnames(mlana_counts))
+xenium_mlana <- data.frame(xenium_id = ids, raw_RNA = as.numeric(mlana_counts["MLANA", ids]), main_lineage = metadata[ids, "main_lineage"])
+rm(metadata)
+gc()
+mlana <- mlana_pairs %>% left_join(tmp_milan, by = "milan_id", relationship = "many-to-one") %>%
+  left_join(tmp_xenium, by = "xenium_id", relationship = "many-to-one") %>%
+  left_join(xenium_mlana, by = "xenium_id", relationship = "many-to-one") %>%
+  filter(if_all(c(raw_MFI, raw_RNA, milan_x, milan_y, xenium_x, xenium_y), is.finite), raw_MFI >= 0, raw_RNA >= 0)
+print(paste0(nrow(mlana), " matched pairs retained; ", nrow(mlana_pairs) - nrow(mlana), " pairs lack valid paired expression or coordinates."))
+
+```
+
+```{r calculate_mlana_enrichment}
+
+mlana <- mlana %>% mutate(is_melanoma = !is.na(main_lineage) & main_lineage == "Melanoma")
+mlana_reference <- filter(mlana, is_melanoma)
+mlana_oe_pseudocount <- 0.05
+mlana_low_signal_cutoff <- 0.1
+mlana_log2_difference_cutoff <- 1
+mlana <- mlana %>% mutate(z_MFI = as.numeric(scale(raw_MFI)), z_RNA = as.numeric(scale(raw_RNA)), protein_oe = if_else(is_melanoma, raw_MFI/mean(mlana_reference$raw_MFI), NA_real_), rna_oe = if_else(is_melanoma, raw_RNA/mean(mlana_reference$raw_RNA), NA_real_), low_both = protein_oe < mlana_low_signal_cutoff & rna_oe < mlana_low_signal_cutoff, relative_log2_enrichment = log2((rna_oe + mlana_oe_pseudocount)/(protein_oe + mlana_oe_pseudocount)), signal_pattern = case_when(!is_melanoma ~ "Not melanoma", low_both ~ "Low signal in both", relative_log2_enrichment > mlana_log2_difference_cutoff ~ "RNA-enriched", relative_log2_enrichment < -mlana_log2_difference_cutoff ~ "Protein-enriched", TRUE ~ "Similar relative signal"))
+
+```
+
+```{r export_mlana_enrichment}
+
+write.csv(mlana %>% mutate(patient = patient_id), file.path(result_dir, "MLANA_spatial_enrichment.csv"), row.names = FALSE)
+
+```
+
+```{r plot_melana_protein}
+
+mlana_xlim <- range(c(-mlana$milan_y, -mlana$xenium_y))
+mlana_ylim <- range(c(-mlana$milan_x, -mlana$xenium_x))
+mlana_map_theme <- theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), plot.background = element_rect(fill = "transparent", color = NA))
+p_milan <- ggplot(mlana, aes(-milan_y, -milan_x, color = z_MFI)) +
+  ggrastr::geom_point_rast(size = 0.05, alpha = 0.85, raster.dpi = 300) +
+  scale_color_gradient2(low = "dodgerblue", mid = "gray87", high = "indianred", limits = c(-3, 3), oob = scales::squish, name = "zMFI") +
+  coord_equal(xlim = mlana_xlim, ylim = mlana_ylim) +
+  labs(title = "MILAN protein", x = NULL, y = NULL) +
+  mlana_map_theme
+
+```
+
+```{r plot_mlana_rna}
+
+p_xenium <- ggplot(mlana, aes(-xenium_y, -xenium_x, color = z_RNA)) +
+  ggrastr::geom_point_rast(size = 0.1, alpha = 0.85, raster.dpi = 300) +
+  scale_color_gradient2(low = "dodgerblue", mid = "gray87", high = "indianred", limits = c(-3, 3), oob = scales::squish, name = "zCounts") +
+  coord_equal(xlim = mlana_xlim, ylim = mlana_ylim) +
+  labs(title = "Xenium RNA", x = NULL, y = NULL) +
+  mlana_map_theme
+
+```
+
+```{r plot_mlana_enrichment}
+
+p_mlana_relative_enrichment <- ggplot(mlana, aes(-xenium_y, -xenium_x)) +
+  ggrastr::geom_point_rast(raster.dpi = 300, data = filter(mlana, !is_melanoma), aes(shape = "Not melanoma"), color = "grey55", size = 0.1, alpha = 0.85) +
+  ggrastr::geom_point_rast(raster.dpi = 300, data = filter(mlana, is_melanoma, low_both), color = "grey80", size = 0.1, alpha = 0.6) +
+  ggrastr::geom_point_rast(raster.dpi = 300, data = filter(mlana, is_melanoma, !low_both), aes(color = relative_log2_enrichment), size = 0.05, alpha = 0.9) +
+  scale_color_gradient2(low = "#D55E00", mid = "#F0F0F0", high = "#2166AC", midpoint = 0, limits = c(-3, 3), breaks = c(-3, 0, 3), labels = c("Protein-enriched", "Similar relative signal", "RNA-enriched"), oob = scales::squish, name = "Relative RNA / protein\nlog2 enrichment") +
+  coord_equal(xlim = mlana_xlim, ylim = mlana_ylim) +
+  scale_shape_manual(values = c(`Not melanoma` = 16), name = NULL) +
+  guides(shape = guide_legend(order = 2, override.aes = list(size = 2, alpha = 1)), color = guide_colorbar(order = 1)) +
+  labs(title = "Melanoma RNA-protein enrichment", x = NULL, y = NULL) +
+  mlana_map_theme +
+  theme(plot.caption = element_text(size = 8, hjust = 0))
+tmp_p <- (p_milan/p_xenium/p_mlana_relative_enrichment) +
+  plot_annotation(title = paste0("MLANA - ", patient_id), theme = theme(plot.title = element_text(face = "bold", hjust = 0.5)))
+ggsave(file.path(figure_dir, "Figure_3G_MLANA_spatial_maps.pdf"), plot = tmp_p, device = "pdf", width = 12, height = 7, 
+    bg = "transparent")
+
+```
+
+## Matched spatial panels
+
+```{r prepare_matched_maps}
+
+make_matched_spatial_plot <- function(modality_name) {
+    modality_types <- names(spatial_cols)[names(spatial_cols) %in% spatial_maps$celltype[spatial_maps$modality == 
+        modality_name]]
+    p <- ggplot(filter(spatial_maps, modality == modality_name), aes(x, y, color = celltype)) +
+      ggrastr::geom_point_rast(size = 0.12, stroke = 0, alpha = 0.9, raster.dpi = 300) +
+      scale_color_manual(values = spatial_cols, limits = modality_types, drop = FALSE, name = "Cell lineage") +
+      coord_equal(xlim = spatial_x_limits, ylim = spatial_y_limits, expand = FALSE) +
+      labs(title = modality_name) +
+      guides(color = guide_legend(override.aes = list(size = 2, alpha = 1), nrow = 1)) +
+      theme_void(base_size = 11) +
+      theme(plot.title = element_text(face = "bold"), legend.position = "bottom", plot.background = element_rect(fill = "transparent", 
+        color = NA))
+    p
+}
+make_matched_spatial_closeup <- function(modality_name) {
+    p <- ggplot(filter(spatial_zoom_maps, modality == modality_name), aes(x, y, color = celltype)) +
+      ggrastr::geom_point_rast(raster.dpi = 300, size = 0.8, stroke = 0, alpha = 0.9, show.legend = TRUE) +
+      scale_color_manual(values = spatial_cols, limits = spatial_legend_types, drop = FALSE, name = NULL) +
+      coord_equal(xlim = spatial_zoom_x, ylim = spatial_zoom_y, expand = FALSE) +
+      guides(color = guide_legend(override.aes = list(size = 2, alpha = 1), nrow = 3, byrow = TRUE)) +
+      theme_void(base_size = 11) +
+      theme(plot.title = element_text(face = "bold"), legend.position = "none", legend.text = element_text(size = 8), 
+        plot.background = element_rect(fill = "transparent", color = NA))
+    p
+}
+
+```
+
+```{r join_spatial_coordinates}
+
+spatial_pairs <- matched %>% filter(patient == "thinmme007", classified)
+spatial_sample <- unique(spatial_pairs$sample_id)
+milan <- fread(file.path(registration_dir, spatial_sample, "milan_cells.csv"), colClasses = list(character = "OID"), data.table = FALSE) %>%
+  transmute(milan_id = OID, milan_x = as.numeric(x_registered), milan_y = as.numeric(y_registered))
+xenium <- fread(file.path(registration_dir, spatial_sample, "xenium_cells.csv"), data.table = FALSE) %>%
+  transmute(xenium_id = cell, xenium_x = as.numeric(x_registered), xenium_y = as.numeric(y_registered))
+spatial_pairs <- spatial_pairs %>% left_join(milan, by = "milan_id", relationship = "one-to-one") %>%
+  left_join(xenium, by = "xenium_id", relationship = "one-to-one")
+lineages <- setNames(spatial_pairs$milan_lineage[!duplicated(spatial_pairs$CellType)], spatial_pairs$CellType[!duplicated(spatial_pairs$CellType)])
+write.csv(spatial_pairs %>% select(patient, milan_id, xenium_id, CellType, main_lineage, milan_lineage, milan_x, 
+    milan_y, xenium_x, xenium_y), file.path(intermediate_dir, "S9BCD_spatial_pairs.csv"), row.names = FALSE)
+
+```
+
+```{r plot_matched_tissue_maps}
+
+spatial_lineage_cols <- c(Melanoma = "#FF0000", Epithelial = "#2E8B57", Fibroblast = "#984EA3", Stroma = "#808080", Endothelial = "#F781BF", Myeloid = "#64AAB6", Lymphocyte = "#FFD700", Mast = "#A65628", Nerves = "#990000")
+spatial_cols <- c(spatial_lineage_cols, c(Blank = "#D9D9D9", Noise = "#555555"))
+spatial_maps <- spatial_pairs %>% transmute(milan_id, xenium_id, modality = "MILAN", x = milan_y, y = milan_x, celltype = coalesce(unname(lineages[CellType]), as.character(CellType))) %>%
+  bind_rows(spatial_pairs %>% transmute(milan_id, xenium_id, modality = "Xenium", x = xenium_y, y = xenium_x, celltype = main_lineage))
+spatial_x_limits <- range(spatial_maps$x)
+spatial_y_limits <- range(spatial_maps$y)
+spatial_legend_types <- names(spatial_cols)[names(spatial_cols) %in% spatial_maps$celltype]
+for (modality_name in c("MILAN", "Xenium")) {
+    ggsave(file.path(figure_dir, paste0(ifelse(modality_name == "MILAN", "S9B", "S9C"), "_", modality_name, "_thinmme007.pdf")), 
+        plot = make_matched_spatial_plot(modality_name), device = "pdf", width = 10, height = 3, units = "in", 
+        bg = "transparent")
+}
+
+```
+
+```{r plot_matched_closeups}
+
+spatial_zoom_x <- c(12500, 14500)
+spatial_zoom_y <- c(8500, 10000)
+spatial_zoom_pairs <- spatial_maps %>% filter(between(x, spatial_zoom_x[1], spatial_zoom_x[2]), between(y, spatial_zoom_y[1], spatial_zoom_y[2])) %>%
+  count(milan_id, xenium_id) %>%
+  filter(n == 2L) %>%
+  select(-n)
+spatial_zoom_maps <- spatial_maps %>% semi_join(spatial_zoom_pairs, by = c("milan_id", "xenium_id"))
+for (modality_name in c("MILAN", "Xenium")) {
+    ggsave(file.path(figure_dir, paste0(ifelse(modality_name == "MILAN", "S9B", "S9C"), "_", modality_name, "_thinmme007_closeup.pdf")), 
+        plot = make_matched_spatial_closeup(modality_name), device = "pdf", width = 5, height = 4, units = "in", 
+        bg = "transparent")
+}
+
+```
+
+```{r plot_spatial_concordance}
+
+spatial_concordance <- spatial_pairs %>% mutate(milan_lineage = unname(lineages[CellType]), milan_lineage = if_else(is.na(milan_lineage), CellType, milan_lineage), concordance = factor(if_else(milan_lineage == main_lineage, "Concordant", "Discordant"), levels = c("Concordant", "Discordant"))) %>%
+  arrange(concordance)
+spatial_concordance_counts <- spatial_concordance %>% count(concordance, .drop = FALSE) %>%
+  mutate(percent = 100 * n/sum(n))
+print(spatial_concordance_counts)
+p_spatial_concordance <- ggplot(spatial_concordance, aes(xenium_y, xenium_x, color = concordance)) +
+  ggrastr::geom_point_rast(size = 0.12, stroke = 0, alpha = 0.9, raster.dpi = 300) +
+  scale_color_manual(values = c(Concordant = "#B8BEC5", Discordant = "#D55E00"), drop = FALSE, name = NULL) +
+  coord_equal(xlim = spatial_x_limits, ylim = spatial_y_limits, expand = FALSE) +
+  labs(title = "MILAN-Xenium lineage concordance") +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1), nrow = 1)) +
+  theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom", plot.background = element_rect(fill = "transparent", 
+    color = NA))
+ggsave(file.path(figure_dir, "S9D_lineage_agreement_thinmme007.pdf"), plot = p_spatial_concordance, device = "pdf", 
+    width = 10, height = 3, units = "in", bg = "transparent")
+spatial_concordance_zoom <- spatial_concordance %>% semi_join(spatial_zoom_pairs, by = c("milan_id", "xenium_id"))
+p_spatial_concordance_closeup <- ggplot(spatial_concordance_zoom, aes(xenium_y, xenium_x, color = concordance)) +
+  ggrastr::geom_point_rast(raster.dpi = 300, size = 0.8, stroke = 0, alpha = 0.9) +
+  scale_color_manual(values = c(Concordant = "#B8BEC5", Discordant = "#D55E00"), drop = FALSE, name = NULL) +
+  coord_equal(xlim = spatial_zoom_x, ylim = spatial_zoom_y, expand = FALSE) +
+  theme_void(base_size = 11) +
+  theme(legend.position = "none", plot.background = element_rect(fill = "transparent", color = NA))
+ggsave(file.path(figure_dir, "S9D_lineage_agreement_thinmme007_closeup.pdf"), plot = p_spatial_concordance_closeup, 
+    device = "pdf", width = 5, height = 4, units = "in", bg = "transparent")
+
+```
+
+## Lineage concordance panels
+
+```{r tabulate_lineage_concordance}
+
+lineage_agreement <- read.csv(file.path(result_dir, "concordance_per_lineage.csv"))
+mapped_classified_concordance_data <- matched %>% filter(classified) %>%
+  count(main_lineage, milan_lineage, name = "N") %>%
+  complete(main_lineage, milan_lineage, fill = list(N = 0L)) %>%
+  group_by(main_lineage) %>%
+  mutate(xenium_total = sum(N)) %>%
+  group_by(milan_lineage) %>%
+  mutate(milan_total = sum(N)) %>%
+  ungroup() %>%
+  mutate(Dice = 2 * N/(xenium_total + milan_total))
+lineage_order <- c("Melanoma", "Epithelial", "Fibroblast", "Stroma", "Endothelial", "Myeloid", "Lymphocyte", "Mast", "Nerves")
+mapped_classified_concordance_data <- mapped_classified_concordance_data %>% mutate(main_lineage = factor(main_lineage, levels = lineage_order), milan_lineage = factor(milan_lineage, levels = rev(lineage_order))) %>%
+  droplevels()
+
+```
+
+```{r plot_lineage_agreement}
+
+combined_lineage_order <- levels(droplevels(mapped_classified_concordance_data$main_lineage))
+lineage_agreement_bars <- lineage_agreement %>% filter(main_lineage != "Overall") %>%
+  transmute(main_lineage, percent = pct_excluding_blank_noise)
+p_concordance_bar_top <- ggplot(lineage_agreement_bars, aes(main_lineage, percent)) +
+  geom_col(fill = "grey35", width = 0.72, na.rm = TRUE) +
+  geom_text(aes(label = sprintf("%.1f", percent)), vjust = -0.4, size = 2.7, show.legend = FALSE, na.rm = TRUE) +
+  scale_x_discrete(limits = combined_lineage_order, expand = expansion(add = 0.6)) +
+  scale_y_continuous(limits = c(0, 100), breaks = c(0, 50, 100), labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.08))) +
+  labs(x = NULL, y = "Concordance") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(), axis.text = element_text(color = "grey20"), 
+    axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title.y = element_text(size = 10), legend.position = "none", 
+    plot.background = element_rect(fill = "transparent", color = NA))
+
+```
+
+```{r plot_concordance_heatmap}
+
+p_concordance_heatmap_bottom <- ggplot(mapped_classified_concordance_data, aes(main_lineage, milan_lineage, fill = Dice)) +
+  geom_tile(color = "white", linewidth = 0.35) +
+  geom_text(aes(label = scales::comma(N), color = Dice >= 0.4), size = 2.7, show.legend = FALSE) +
+  scale_color_manual(values = c(`FALSE` = "grey15", `TRUE` = "white"), guide = "none") +
+  scale_fill_gradient(low = "#FFF7EC", high = "#8C2D04", limits = c(0, 1), name = "Dice\nsimilarity") +
+  scale_x_discrete(limits = combined_lineage_order, expand = expansion(add = 0.6)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(x = "Xenium lineage", y = "MILAN mapped lineage") +
+  guides(fill = guide_colorbar(title.position = "top", direction = "vertical")) +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid = element_blank(), axis.title = element_text(size = 10), axis.text = element_text(size = 9, color = "grey20"), 
+    axis.text.x = element_text(angle = 55, hjust = 1), legend.position = "right", legend.title = element_text(size = 8), 
+    legend.text = element_text(size = 7), plot.background = element_rect(fill = "transparent", color = NA))
+p_combined_lineage_concordance <- patchwork::wrap_plots(p_concordance_bar_top, p_concordance_heatmap_bottom, ncol = 1, heights = grid::unit(c(1.3, 3.2), "in"))
+ggsave(file.path(figure_dir, "S9E_lineage_concordance.pdf"), plot = p_combined_lineage_concordance, device = "pdf", 
+    width = 7, height = 5.8, units = "in", bg = "transparent")
+
+```
+
+```{r summarize_marker_coverage}
+
+milan_lineage_marker_sets <- list(Melanoma = c("MELANA", "MITF", "S100", "S100B", "SOX10"), Epithelial = "CK", Fibroblast = "FAP", Stroma = "aSMA", Endothelial = c("AQP1", "CD31"), Myeloid = "CD68", Lymphocyte = c("CD3", "CD4", "CD20", "CD79a", "FOXP3"), Nerves = character(0))
+milan_marker_coverage <- tibble(main_lineage = names(milan_lineage_marker_sets), n_markers = lengths(milan_lineage_marker_sets), markers = vapply(milan_lineage_marker_sets, paste, collapse = ", ", FUN.VALUE = character(1)))
+marker_coverage_concordance <- lineage_agreement %>% filter(main_lineage != "Overall") %>%
+  left_join(milan_marker_coverage, by = "main_lineage", relationship = "one-to-one")
+write.csv(marker_coverage_concordance, file.path(result_dir, "lineage_marker_coverage.csv"), row.names = FALSE)
+marker_coverage_long <- marker_coverage_concordance %>% pivot_longer(starts_with("pct_"), names_to = "population", values_to = "percent") %>%
+  mutate(population = factor(population, levels = c("pct_including_blank_noise", "pct_excluding_blank_noise"), labels = c("Including Blank/Noise", "Excluding Blank/Noise"))) %>%
+  filter(population == "Excluding Blank/Noise")
+marker_coverage_means <- marker_coverage_long %>% group_by(n_markers) %>%
+  summarise(mean_concordance = mean(percent, na.rm = TRUE), n_lineages = n(), .groups = "drop")
+
+```
+
+```{r plot_marker_coverage}
+
+p_marker_coverage_concordance <- ggplot(marker_coverage_long, aes(n_markers, percent)) +
+  geom_line(data = marker_coverage_means, aes(y = mean_concordance, group = 1), color = "grey55", linewidth = 0.7) +
+  geom_point(size = 2.4, color = "grey20") +
+  ggrepel::geom_text_repel(aes(label = main_lineage), size = 3, seed = 20260910, max.overlaps = Inf, show.legend = FALSE) +
+  scale_x_continuous(breaks = 0:max(milan_marker_coverage$n_markers), expand = expansion(add = 0.65)) +
+  scale_y_continuous(breaks = seq(0, 100, 20), labels = function(x) paste0(x, "%")) +
+  coord_cartesian(ylim = c(0, 100), clip = "off") +
+  labs(x = "Number of MILAN annotation markers assigned to lineage", y = "Mapped lineage concordance (Xenium reference)") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), legend.position = "none", legend.text = element_text(size = 9), axis.text = element_text(color = "grey20"), 
+    plot.caption = element_text(size = 8, hjust = 0), plot.background = element_rect(fill = "transparent", color = NA))
+ggsave(file.path(figure_dir, "S9F_marker_coverage.pdf"), plot = p_marker_coverage_concordance, device = "pdf", 
+    width = 6, height = 5, units = "in", bg = "transparent")
+
+```
+
+## RNA–protein concordance
+
+```{r prepare_correlation_panels}
+
+pooled <- correlations
+by_patient <- patient_correlations
+markers <- c('MELANA', 'MITF', 'S100B', 'AQP1', 'CK', 'Ki67')
+
+```
+
+```{r plot_pooled_correlations}
+
+pooled <- pooled %>% mutate(mapping = if_else(marker == 'CK', 'Composite', 'Direct'), marker = factor(marker, levels = rev(markers)))
+limit <- max(abs(pooled$pearson_r), na.rm = TRUE)
+p <- ggplot(pooled, aes(pearson_r, marker, color = mapping)) + geom_vline(xintercept = 0, color = 'grey65', linewidth = 0.4) +
+  geom_segment(aes(x = 0, xend = pearson_r, yend = marker), linewidth = 0.7, alpha = 0.75) + geom_point(size = 2.8) +
+  scale_x_continuous(limits = c(-limit, limit)) + scale_color_manual(values = c(Direct = '#0072B2', Composite = '#D55E00'), name = NULL) +
+  labs(x = 'RNA–protein correlation', y = NULL) + theme_classic(base_size = 11) + theme(strip.background = element_blank(), strip.text = element_text(face = 'bold'), panel.spacing = grid::unit(1, 'cm'), legend.position = 'top')
+ggsave(file.path(figure_dir, "S9G_pooled_RNA_protein_correlations.pdf"), p, width = 3, height = 3)
+
+```
+
+```{r plot_patient_correlations}
+
+mat <- by_patient %>% select(patient, marker, pearson_r) %>% pivot_wider(names_from = marker, values_from = pearson_r) %>% arrange(patient)
+patient_order <- mat$patient[hclust(dist(as.matrix(mat[, -1])), method = 'ward.D2')$order]
+by_patient <- by_patient %>% mutate(patient = factor(patient, levels = rev(patient_order)), marker = factor(marker, levels = markers))
+p <- ggplot(by_patient, aes(marker, patient, fill = pearson_r)) + geom_tile(color = 'white', linewidth = 0.7) + geom_text(aes(label = sprintf('%.2f', pearson_r)), color = 'grey15', size = 2) +
+  scale_fill_gradient2(low = '#2166AC', mid = 'white', high = '#B2182B', midpoint = 0, limits = c(-1, 1), name = 'Pearson r', oob = scales::squish) +
+  coord_fixed() + labs(x = NULL, y = NULL) + theme_minimal(base_size = 10) + theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1), legend.position = 'bottom') +
+  guides(fill = guide_colorbar(title.position = "top"))
+ggsave(file.path(figure_dir, "S9H_patient_RNA_protein_correlations.pdf"), p, width = 3, height = 3)
+
+```
+
+```{r plot_marker_scatterplots}
+
+for (marker_name in c("MELANA", "AQP1")) {
+    data <- paired %>% filter(marker == marker_name)
+    rho <- cor(data$RNA, data$protein)
+    gene <- ifelse(marker_name == "MELANA", "MLANA", "AQP1")
+    panel <- ifelse(marker_name == "MELANA", "S9I", "S9J")
+    p <- ggplot(data, aes(RNA, protein)) + geom_hex(bins = 55) + geom_smooth(method = "lm", formula = y ~ x, se = FALSE, 
+        color = "#B2182B", linewidth = 0.7) +
+      scale_fill_viridis_c(trans = "log10", option = "D", name = "Cells") +
+      annotate("label", x = Inf, y = -Inf, label = sprintf("Pearson Cor. = %.2f", rho), hjust = 1.08, vjust = -0.6, 
+        size = 3.4, fill = scales::alpha("white", 0.9), color = "grey15", linewidth = 0, label.padding = grid::unit(0.18, 
+            "lines"), label.r = grid::unit(0.12, "lines")) +
+      labs(title = marker_name, subtitle = gene, x = "Xenium RNA expression", y = "MILAN protein expression") + 
+        theme_classic(base_size = 11) +
+      theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(color = "grey40"), legend.position = "right")
+    ggsave(file.path(figure_dir, paste0(panel, "_", marker_name, "_RNA_protein.pdf")), p, width = 5, height = 4)
+}
+
+```
+
+## Cells in the Supplementary Figure 10 regions
+
+```{r load_metaprogram_regions}
+
+regions <- read.csv(file.path(input_dir, 'metaprogram_image_regions.csv'))
+regions$patient <- samples$patient[match(regions$fp_sample_id, samples$scene)]
+
+```
+
+```{r select_region_cells}
+
+selected <- bind_rows(lapply(seq_len(nrow(regions)), function(i) {
+    region <- regions[i, ]
+    matched %>% filter(scene == region$fp_sample_id, between(X, region$x, region$x + region$width), between(Y, region$y, 
+        region$y + region$height)) %>% mutate(roi_id = region$roi_id)
+}))
+fields <- c('roi_id', 'milan_id', 'xenium_id', 'CellType', 'main_lineage', 'melanoma_mp_labels', 'X', 'Y')
+
+```
+
+```{r export_region_cells}
+
+write.csv(selected %>% select(patient, all_of(fields)), file.path(intermediate_dir, "metaprogram_image_cells.csv"), 
+    row.names = FALSE)
+write.csv(regions, file.path(result_dir, "metaprogram_image_regions.csv"), row.names = FALSE)
+
+```
+

@@ -1,0 +1,304 @@
+---
+title: "MILAN matching protein profiles"
+author: "Asier Antoranz"
+output:
+  html_document:
+    df_print: paged
+---
+
+Matches MILAN and Xenium cells, compares their lineage annotations and summarises protein expression across cell types and melanoma metaprogrammes.
+
+**Inputs:** Normalised protein measurements and annotations in `paper_data/MILAN/raw`, sample metadata in `paper_data/MILAN/inputs`, coordinates in `paper_data/Registration/MILAN`, and final annotations from Xenium notebook 04.
+
+**Outputs:** Matched cells, protein measurements and display embeddings in `data/`; composition, concordance and protein-profile tables in `results/`; profile and UMAP panels in `figures/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(data.table)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+
+outdir <- file.path(output_root, 'MILAN')
+input_dir <- file.path(data_root, 'MILAN', 'inputs')
+raw_dir <- file.path(data_root, 'MILAN', 'raw')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+figure_dir <- file.path(outdir, 'figures')
+xenium_dir <- file.path(output_root, 'Xenium', 'data')
+for (path in c(outdir, intermediate_dir, result_dir, figure_dir)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+future::plan('sequential')
+registration_dir <- file.path(data_root, 'Registration', 'MILAN')
+matches_file <- file.path(intermediate_dir, 'xenium_milan_matches.csv')
+samples <- read.csv(file.path(input_dir, 'samples.csv'), colClasses = 'character')
+samples$scene <- samples$sample_id
+
+```
+
+## Match registered MILAN and Xenium cells
+
+```{r cell_matching_function}
+
+match_registered_cells <- function(milan, xenium) {
+    milan_xy <- as.matrix(milan[, c("x_registered", "y_registered")])
+    xenium_xy <- as.matrix(xenium[, c("x_registered", "y_registered")])
+    nearest <- RANN::nn2(xenium_xy, milan_xy, k = 2)
+    reverse <- RANN::nn2(milan_xy, xenium_xy, k = 1)$nn.idx[, 1]
+    matches <- data.frame(milan_id = as.character(milan$OID), xenium_id = xenium$cell[nearest$nn.idx[, 1]], d1_um = nearest$nn.dists[, 
+        1] * 0.6525, d2_um = nearest$nn.dists[, 2] * 0.6525)
+    matches$ratio <- matches$d1_um/matches$d2_um
+    matches$mutual <- reverse[nearest$nn.idx[, 1]] == seq_len(nrow(milan))
+    matches$accepted <- matches$mutual & matches$d1_um <= 5 & matches$ratio <= 0.7
+    matches
+}
+
+```
+
+```{r match_registered_cells}
+
+matched <- lapply(samples$sample_id, function(sid) {
+    milan <- read.csv(file.path(registration_dir, sid, 'milan_cells.csv'), colClasses = c(OID = 'character'))
+    xenium <- read.csv(file.path(registration_dir, sid, 'xenium_cells.csv'))
+    matches <- match_registered_cells(milan, xenium)
+    matches$sample_id <- sid
+    matches
+})
+matches <- bind_rows(matched)
+
+```
+
+```{r export_cell_matches}
+
+write.csv(matches, matches_file, row.names = FALSE)
+
+```
+
+## MILAN annotations and patient IDs
+
+```{r load_protein_annotations}
+
+annotation_dir <- file.path(raw_dir, 'annotations')
+files <- file.path(annotation_dir, paste0(c('thinmme005_2', 'thinmme010_2', 'thinmme007_2', 'thinmme009_2', 'thinmme006_2', 'thinmme003_2'), '.csv'))
+cells <- bind_rows(lapply(files, function(path) fread(path, colClasses = list(character = 'OID'), data.table = FALSE))) %>%
+  transmute(scene = sample_id, OID, CellType, X, Y)
+
+```
+
+```{r attach_patient_metadata}
+
+cells <- cells %>% left_join(samples, by = 'scene', relationship = 'many-to-one')
+
+```
+
+```{r summarize_celltype_composition}
+
+composition <- cells %>% count(scene, patient, pair, outcome, CellType, name = 'n_cells') %>%
+  group_by(scene) %>% mutate(total_cells = sum(n_cells), percent = 100 * n_cells / total_cells) %>% ungroup() %>% arrange(patient, CellType)
+
+```
+
+```{r export_celltype_composition}
+
+write.csv(composition, file.path(result_dir, "milan_celltype_composition.csv"), row.names = FALSE)
+
+```
+
+## Matched MILAN and Xenium cells
+
+```{r load_xenium_annotations}
+
+xenium_path <- file.path(xenium_dir, 'final_annotation.rds')
+xenium <- readRDS(xenium_path)
+xenium$xenium_id <- rownames(xenium)
+
+```
+
+```{r join_matched_annotations}
+
+matches <- matches %>% filter(accepted)
+fields <- c('xenium_id', 'main_lineage', 'melanoma_mp_labels', 'pt_class', 'pt_route1', 'pt_route2', 'pt_merged', 'delta')
+matched <- matches %>% inner_join(cells, by = c('sample_id', 'milan_id' = 'OID'), relationship = 'one-to-one') %>% inner_join(xenium[, fields], by = 'xenium_id', relationship = 'many-to-one')
+lineages <- c(Tumor = 'Melanoma', Tcy = 'Lymphocyte', Th = 'Lymphocyte', Treg = 'Lymphocyte', Bcell = 'Lymphocyte', Macrophage = 'Myeloid', Endothelial = 'Endothelial', Epithelial = 'Epithelial', Fibroblast = 'Fibroblast', SmoothMuscle = 'Stroma')
+matched <- matched %>% mutate(milan_lineage = coalesce(unname(lineages[CellType]), CellType), classified = !milan_lineage %in% c('Blank', 'Noise'), agrees = main_lineage == milan_lineage)
+
+```
+
+```{r summarize_lineage_agreement}
+
+summary_counts <- function(x) x %>% summarise(n_pairs = n(), n_concordant = sum(agrees), n_classified = sum(classified), n_classified_concordant = sum(agrees & classified), .groups = 'drop')
+agreement <- bind_rows(matched %>% group_by(main_lineage) %>% summary_counts(), summary_counts(matched) %>% mutate(main_lineage = 'Overall')) %>%
+  mutate(n_blank_noise = n_pairs - n_classified, pct_including_blank_noise = 100 * n_concordant / n_pairs, pct_excluding_blank_noise = 100 * n_classified_concordant / n_classified)
+confusion <- matched %>% count(main_lineage, milan_lineage, name = 'n_pairs') %>% complete(main_lineage, milan_lineage, fill = list(n_pairs = 0L))
+
+```
+
+```{r export_annotation_agreement}
+
+write.csv(agreement, file.path(result_dir, "concordance_per_lineage.csv"), row.names = FALSE)
+write.csv(confusion, file.path(result_dir, "lineage_confusion_counts.csv"), row.names = FALSE)
+
+```
+
+## MILAN protein profiles
+
+```{r select_protein_markers}
+
+phenotype_markers <- c('AQP1', 'aSMA', 'CD3', 'CD4', 'CD20', 'CD31', 'CD68', 'CD79a', 'CK', 'FAP', 'FOXP3', 'MELANA', 'MITF', 'S100', 'S100B', 'SOX10')
+mp_markers <- c('MELANA', 'MITF', 'S100', 'S100B', 'SOX10', 'SOX9', 'AQP1', 'CK', 'Ki67', 'NGFR', 'TCF4')
+
+```
+
+```{r load_protein_measurements}
+
+path <- file.path(raw_dir, 'normalized_proteins.csv')
+markers <- fread(path, select = c('sample_id', 'OID', union(phenotype_markers, mp_markers)), colClasses = list(character = 'OID'), data.table = FALSE) %>% rename(scene = sample_id)
+cells <- cells %>% left_join(markers, by = c('scene', 'OID'), relationship = 'one-to-one')
+matched <- matched %>% left_join(markers, by = c('scene', 'milan_id' = 'OID'), relationship = 'one-to-one')
+
+```
+
+```{r summarize_phenotype_profiles}
+
+phenotype <- cells %>% filter(!CellType %in% c('Blank', 'Noise')) %>% select(CellType, all_of(phenotype_markers)) %>% pivot_longer(all_of(phenotype_markers), names_to = 'marker', values_to = 'expression') %>%
+  group_by(CellType, marker) %>% summarise(mean_expression = mean(expression), pct_above_mean = 100 * mean(expression > 0), .groups = 'drop')
+
+```
+
+```{r summarize_metaprogram_profiles}
+
+melanoma <- matched %>% filter(melanoma_mp_labels != 'Non.Melanoma') %>% select(melanoma_mp_labels, all_of(mp_markers)) %>% pivot_longer(all_of(mp_markers), names_to = 'marker', values_to = 'expression')
+raw_profiles <- melanoma %>% group_by(melanoma_mp_labels, marker) %>% summarise(mean_expression = mean(expression), fraction_positive = mean(expression > 0), .groups = 'drop')
+mp_profiles <- melanoma %>% group_by(marker) %>% mutate(expression = as.numeric(scale(expression))) %>% group_by(melanoma_mp_labels, marker) %>% summarise(mean_expression = mean(expression), fraction_positive = mean(expression > 0), .groups = 'drop')
+
+```
+
+```{r export_protein_profiles}
+
+saveRDS(matched, file.path(intermediate_dir, "matched_cells_with_markers.rds"))
+write.csv(phenotype, file.path(result_dir, "phenotype_marker_profiles.csv"), row.names = FALSE)
+write.csv(mp_profiles, file.path(result_dir, "metaprogram_protein_profiles.csv"), row.names = FALSE)
+
+```
+
+## Protein profile panels
+
+```{r protein_plot_helpers}
+
+profile_plot <- function(data, group_order, marker_order, palette, limits = NULL) {
+    data <- data %>% mutate(x = match(marker, marker_order), y = match(group, rev(group_order)))
+    rows <- distinct(data, group, y)
+    p <- ggplot(data, aes(x, y)) + geom_hline(yintercept = seq_along(group_order), color = "grey93", linewidth = 0.3) +
+      geom_segment(data = rows, aes(x = 0.25, xend = 0.25, y = y - 0.32, yend = y + 0.32, color = group), 
+        inherit.aes = FALSE, linewidth = 3, lineend = "round", show.legend = FALSE) +
+      geom_point(aes(size = percent, fill = mean_expression), shape = 21, color = "grey40", stroke = 0.2) +
+      scale_color_manual(values = palette) + scale_fill_gradient2(low = "#356A9A", mid = "#F7F7F7", high = "#B63D3D", 
+        midpoint = 0, limits = limits, oob = scales::squish, name = "Mean expression\n(z-score)") +
+      scale_size_area(max_size = 6, limits = c(0, 100), breaks = c(25, 50, 75, 100), name = "Above group\nmean (%)") +
+      scale_x_continuous(breaks = seq_along(marker_order), labels = marker_order, limits = c(0, length(marker_order) + 
+        0.6), expand = c(0, 0)) +
+      scale_y_continuous(breaks = seq_along(group_order), labels = rev(group_order), expand = expansion(add = 0.6)) + 
+        labs(x = NULL, y = NULL) +
+      guides(fill = guide_colorbar(order = 1, direction = "vertical", title.position = "top"), size = guide_legend(order = 2, ncol = 1, 
+        title.position = "top", title.hjust = 0, override.aes = list(fill = "grey65"))) +
+      theme_minimal(base_size = 11, base_family = "sans") + theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, 
+        hjust = 1, color = "grey15"), axis.text.y = element_text(color = "grey15")) +
+      theme(legend.position = "right", legend.box = "vertical", legend.title = element_text(size = 9, hjust = 0), legend.text = element_text(size = 8), 
+        plot.background = element_rect(fill = "transparent", color = NA))
+    p
+}
+
+phenotype_cols <- c(Tumor = '#FF0000', Epithelial = '#2E8B57', Fibroblast = '#984EA3', SmoothMuscle = '#808080', Endothelial = '#F781BF', Macrophage = '#64AAB6', Bcell = '#FFE680', Th = '#FFD700', Tcy = '#D9A500', Treg = '#A67C00')
+mp_cols <- c('Differentiated melanocytic' = 'brown', 'Epithelial-adjacent' = '#009E73', 'Mesenchymal invasive' = 'pink', 'Proliferation/cell cycle' = 'indianred', 'Early developmental stress' = 'goldenrod', 'Nevus-like senescence' = '#D55E00', 'IFN-associated stress' = 'coral')
+
+```
+
+```{r plot_phenotype_profiles}
+
+phenotype <- phenotype %>% rename(group = CellType, percent = pct_above_mean)
+mat <- phenotype %>% select(group, marker, mean_expression) %>% pivot_wider(names_from = marker, values_from = mean_expression)
+marker_matrix <- as.matrix(mat[, phenotype_markers])
+marker_order <- phenotype_markers[hclust(dist(t(marker_matrix)), method = 'complete')$order]
+p <- profile_plot(phenotype, names(phenotype_cols), marker_order, phenotype_cols)
+ggsave(file.path(figure_dir, "Figure_3F_phenotype_profiles.pdf"), p, width = 6.4, height = 4, bg = "transparent")
+
+```
+
+```{r plot_metaprogram_profiles}
+
+profiles <- mp_profiles %>% rename(group = melanoma_mp_labels) %>% mutate(percent = 100 * fraction_positive)
+mat <- raw_profiles %>% select(melanoma_mp_labels, marker, mean_expression) %>% pivot_wider(names_from = marker, values_from = mean_expression)
+group_order <- c('Epithelial-adjacent', 'Mesenchymal invasive', 'IFN-associated stress', 'Proliferation/cell cycle', 'Nevus-like senescence', 'Differentiated melanocytic', 'Early developmental stress')
+marker_order <- mp_markers
+p <- profile_plot(profiles, group_order, marker_order, mp_cols, c(-1, 1))
+ggsave(file.path(figure_dir, "Figure_3H_metaprogram_protein_profiles.pdf"), p, width = 6, height = 3.6, bg = "transparent")
+
+```
+
+```{r export_metaprogram_order}
+
+write.csv(data.frame(position = seq_along(group_order), metaprogram = group_order), file.path(intermediate_dir, 
+    "Figure_3H_metaprogram_order.csv"), row.names = FALSE)
+
+```
+
+## MILAN display UMAP
+
+```{r prepare_protein_umap}
+
+library(umap)
+plot_seed <- 20260910
+
+```
+
+```{r sample_protein_cells}
+
+set.seed(plot_seed)
+tmp_plot <- cells %>% filter(!CellType %in% c('Blank', 'Noise')) %>% group_by(CellType) %>% group_modify(~ slice_sample(.x, n = min(2500, nrow(.x)))) %>% ungroup()
+write.csv(tmp_plot %>% select(scene, OID, patient, CellType), file.path(result_dir, "display_umap_cell_dictionary.csv"), 
+    row.names = FALSE)
+
+```
+
+```{r fit_protein_umap}
+
+tmp_matrix <- as.matrix(tmp_plot[, phenotype_markers])
+tmp_umap <- umap(tmp_matrix, preserve.seed = TRUE)
+tmp_plot <- tmp_plot %>% mutate(umap1 = tmp_umap$layout[, 1], umap2 = tmp_umap$layout[, 2])
+tmp_centroids <- tmp_plot %>% group_by(CellType) %>% summarise(umap1 = median(umap1), umap2 = median(umap2), .groups = 'drop')
+
+```
+
+```{r plot_protein_umap}
+
+milan_label_cols <- phenotype_cols
+milan_label_cols[c('Bcell', 'Th', 'Tcy', 'Treg')] <-
+  c('#92752B', '#977C00', '#896800', '#715500')
+milan_label_cols[c('Endothelial', 'Macrophage')] <- c('#B94085', '#367784')
+tmp_p <- ggplot(tmp_plot, aes(umap1, umap2, color = CellType)) +
+  ggrastr::geom_point_rast(size = 0.65, alpha = 0.85, stroke = 0, raster.dpi = 300) +
+  scale_color_manual(values = phenotype_cols) +
+  scale_fill_manual(values = milan_label_cols) +
+  ggrepel::geom_label_repel(data = tmp_centroids, aes(umap1, umap2, label = CellType, fill = CellType), inherit.aes = FALSE, 
+    color = "white", family = "sans", size = 5, max.overlaps = Inf, seed = plot_seed) +
+  coord_equal() +
+  scale_x_continuous(expand = expansion(mult = 0.06)) +
+  scale_y_continuous(expand = expansion(mult = 0.06)) +
+  theme_void(base_size = 11, base_family = 'sans') +
+  theme(legend.position = "none", plot.background = element_rect(fill = "transparent", color = NA))
+pdf(file.path(figure_dir, "Figure_3D_phenotype_UMAP.pdf"), width = 5, height = 5)
+print(tmp_p)
+dev.off()
+
+```
+
