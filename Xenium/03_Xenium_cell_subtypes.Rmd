@@ -1,0 +1,422 @@
+---
+title: "Non-melanoma cell subtypes"
+author: "Asier Antoranz"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+---
+
+Resolves non-melanoma cell subtypes using compartment-specific clustering, reference mapping and marker-based annotation.
+
+**Inputs:** Annotated cells from Xenium notebook 01, the skin reference atlas in `paper_data/Xenium/reference_atlas`, and manual subtype annotations in `paper_data/Xenium/inputs`.
+
+**Outputs:** Compartment-specific annotations and reference predictions in `data/`; reference-label recovery metrics and clustering feature lists in `results/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+code_root <- 'path_to_code'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                    cache = FALSE, cache.lazy = FALSE, fig.align = 'center')
+knitr::opts_knit$set(root.dir = code_root)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(RColorBrewer)
+library(Seurat)
+library(Matrix)
+library(data.table)
+library(ggplot2)
+
+outdir <- file.path(output_root, 'Xenium')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+data_dir <- file.path(data_root, 'Xenium')
+input_dir <- file.path(data_dir, 'inputs')
+atlas_dir <- file.path(data_root, 'Xenium', 'reference_atlas')
+subtype_dictionary <- read.csv(file.path(input_dir, 'manual_lineage_subtypes.csv'))
+for (path in c(outdir, intermediate_dir, result_dir)) {
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+}
+options(Seurat.object.assay.version = 'v5', future.globals.maxSize = 50 * 1024^3)
+future::plan('sequential')
+
+```
+
+## Non-melanoma subtypes
+
+Reference-label recovery was assessed using the genes shared with the Xenium panel. Final labels also considered marker expression and tissue location; unreliable reference distinctions were merged or replaced by marker-based annotations.
+
+### Myeloid clustering
+
+```{r myeloid_clustering}
+
+obj <- readRDS(file.path(intermediate_dir, 'annotated.rds'))
+
+# initial myeloid cells
+sub <- subset(obj, cells = colnames(obj)[obj$main_lineage == 'Myeloid'])
+counts <- LayerData(sub, assay = 'Xenium', layer = 'counts')
+features_use <- names(which(Matrix::rowMeans(counts > 0) >= 0.05))
+
+# PCA
+sub <- RunPCA(sub, features = features_use, npcs = 30, seed.use = 42, verbose = FALSE)
+
+# embedding and clusters
+sub <- RunUMAP(sub, dims = 1:8, seed.use = 42, verbose = FALSE)
+sub <- FindNeighbors(sub, dims = 1:8, verbose = FALSE)
+sub <- FindClusters(sub, resolution = 0.8, algorithm = 1, random.seed = 0, verbose = FALSE)
+
+```
+
+```{r reference_recovery_helpers}
+
+reference_recovery_metrics <- function(prediction, labels) {
+  counts <- table(prediction$labels, labels)
+  metrics <- data.frame(cell_type = intersect(rownames(counts), colnames(counts)))
+  metrics %>% mutate(TP = counts[cbind(cell_type, cell_type)], truth_n = colSums(counts)[cell_type], predicted_n = rowSums(counts)[cell_type], recall = TP / truth_n, precision = TP / predicted_n, F1 = 2 * precision * recall / (precision + recall))
+}
+
+reference_holdout <- function(expression, labels, seed = 1234) {
+  set.seed(seed)
+  groups <- split(seq_len(ncol(expression)), labels)
+  test <- unlist(lapply(groups, function(index) sample(index, max(1, floor(0.2 * length(index))))), use.names = FALSE)
+  list(test = test, train = setdiff(seq_len(ncol(expression)), test))
+}
+
+predict_holdout <- function(expression, labels, split) {
+  SingleR::SingleR(test = expression[, split$test, drop = FALSE], ref = expression[, split$train, drop = FALSE], labels = labels[split$train], de.method = 'wilcox', fine.tune = TRUE, num.threads = 8)
+}
+
+```
+
+### Myeloid reference recovery
+
+```{r myeloid_reference_recovery}
+
+library(SingleR)
+ref <- as(Matrix::readMM(file.path(atlas_dir, 'ref.mtx')), 'CsparseMatrix')
+rownames(ref) <- readLines(file.path(atlas_dir, 'genes.txt'))
+atlas_labels <- readLines(file.path(atlas_dir, 'labels_detailed.txt'), encoding = 'UTF-8')
+
+# myeloid reference
+subtypes <- c('Mono', 'Mac', 'LC', 'CD1C+ DC', 'CLEC9A+ DC', 'CCR7+ DC')
+selected <- which(atlas_labels %in% subtypes)
+reflab <- atlas_labels[selected]
+refM <- as.matrix(ref[, selected])
+
+# held-out cells
+split <- reference_holdout(refM, reflab)
+prediction <- predict_holdout(refM, reflab, split)
+
+# subtype recovery
+metrics <- reference_recovery_metrics(prediction, reflab[split$test])
+write.csv(metrics, file.path(result_dir, 'celltype_recovery_myeloid.csv'), row.names = FALSE)
+
+```
+
+### Myeloid annotation
+
+Reference transfer was retained, but monocytes were merged with macrophages because the panel lacks monocyte-specific markers; CD1C+ DC was renamed cDC2 because CD1C is not measured. Marker expression overruled cluster 6 to B cells (CD79A/MZB1) and cluster 13 to pDC (IL3RA/IRF8).
+
+```{r myeloid_annotation}
+
+atlas <- list(expression = refM, labels = reflab, atlas_index = selected)
+
+# atlas projection
+expression <- LayerData(sub, assay = 'Xenium', layer = 'data')
+common <- intersect(rownames(expression), rownames(atlas$expression))
+prediction <- SingleR(test = expression[common, ], ref = atlas$expression[common, ], labels = atlas$labels, aggr.ref = TRUE, fine.tune = TRUE)
+
+# annotations
+sub$Myeloid_label <- prediction$labels
+sub$Myeloid_label[sub$Xenium_snn_res.0.8 %in% 6] <- 'B.Lymphocyte'
+sub$Myeloid_label[sub$Xenium_snn_res.0.8 %in% 13] <- 'pDC'
+sub$Myeloid_label[sub$Myeloid_label == 'Mono'] <- 'Mac'
+sub$Myeloid_label[sub$Myeloid_label == 'CD1C+ DC'] <- 'cDC2'
+saveRDS(sub, file.path(intermediate_dir, 'myeloid_annotated.rds'))
+
+```
+
+### Endothelial clustering
+
+```{r endothelial_clustering}
+
+# endothelial cells
+sub <- subset(obj, cells = colnames(obj)[obj$main_lineage == 'Endothelial'])
+features_use <- names(which(Matrix::rowMeans(LayerData(sub, assay = 'Xenium', layer = 'counts') > 0) >= 0.05))
+
+# PCA
+sub <- RunPCA(sub, features = features_use, npcs = 30, seed.use = 42, verbose = FALSE)
+
+# clusters
+sub <- FindNeighbors(sub, dims = 1:5, verbose = FALSE)
+sub <- FindClusters(sub, resolution = 0.8, algorithm = 1, random.seed = 0, verbose = FALSE)
+
+```
+
+### Endothelial reference recovery
+
+HEC and VEC were poorly distinguished by the panel, so they were merged for reference transfer. HEC identity was then restored only in clusters 6 and 8, which showed high SELE expression.
+
+```{r endothelial_reference_recovery}
+
+# endothelial reference
+selected <- which(atlas_labels %in% c('VEC', 'LEC', 'HEC'))
+reflab <- atlas_labels[selected]
+refM <- as.matrix(ref[, selected])
+
+# held-out cells
+split <- reference_holdout(refM, reflab)
+prediction <- predict_holdout(refM, reflab, split)
+metrics <- reference_recovery_metrics(prediction, reflab[split$test])
+write.csv(metrics, file.path(result_dir, 'celltype_recovery_endothelial.csv'), row.names = FALSE)
+
+# merge HEC and VEC
+lookup <- c(HEC = 'VEC', LEC = 'LEC', VEC = 'VEC')
+coarse <- unname(lookup[reflab])
+prediction <- predict_holdout(refM, coarse, split)
+metrics <- reference_recovery_metrics(prediction, coarse[split$test])
+write.csv(metrics, file.path(result_dir, 'celltype_recovery_endothelial_merged.csv'), row.names = FALSE)
+
+```
+
+### Endothelial annotation
+
+```{r endothelial_annotation}
+
+atlas <- list(expression = refM, labels = coarse, atlas_index = selected)
+
+# cluster projection
+expression <- LayerData(sub, assay = 'Xenium', layer = 'data')
+common <- intersect(rownames(expression), rownames(atlas$expression))
+prediction <- SingleR(test = expression[common, ], ref = atlas$expression[common, ], labels = atlas$labels, clusters = sub$Xenium_snn_res.0.8, fine.tune = TRUE)
+lookup <- setNames(prediction$labels, rownames(prediction))
+sub$Endothelial_label <- unname(lookup[as.character(sub$Xenium_snn_res.0.8)])
+sub$Endothelial_label[sub$Xenium_snn_res.0.8 %in% c(6, 8)] <- 'HEC'
+saveRDS(sub, file.path(intermediate_dir, 'endothelial_annotated.rds'))
+
+```
+
+### Fibroblast clustering
+
+```{r fibroblast_clustering}
+
+# fibroblast cells
+sub <- subset(obj, cells = colnames(obj)[obj$main_lineage == 'Fibroblast'])
+features_use <- names(which(Matrix::rowMeans(LayerData(sub, assay = 'Xenium', layer = 'counts') > 0) >= 0.05))
+
+# PCA
+sub <- RunPCA(sub, features = features_use, npcs = 30, seed.use = 42, verbose = FALSE)
+
+# clusters
+sub <- FindNeighbors(sub, dims = 1:12, verbose = FALSE)
+sub <- FindClusters(sub, resolution = 0.8, algorithm = 1, random.seed = 0, verbose = FALSE)
+
+```
+
+### Fibroblast reference recovery
+
+```{r fibroblast_reference_recovery}
+
+# fibroblast recovery
+subtypes <- c('Papil Fib', 'Retic Fib I', 'Retic Fib II', 'Retic Fib III', 'Perivasc Fib I', 'Perivasc Fib II', 'DP', 'DS')
+selected <- which(atlas_labels %in% subtypes)
+expression <- as.matrix(ref[, selected])
+reflab <- atlas_labels[selected]
+split <- reference_holdout(expression, reflab)
+prediction <- predict_holdout(expression, reflab, split)
+write.csv(reference_recovery_metrics(prediction, reflab[split$test]), file.path(result_dir, 'celltype_recovery_fibroblast.csv'), row.names = FALSE)
+
+# merged fibroblast recovery
+lookup <- c('DP' = 'DP', 'DS' = 'DS', 'Papil Fib' = 'Papil Fib', 'Perivasc Fib I' = 'Perivasc Fib', 'Perivasc Fib II' = 'Perivasc Fib', 'Retic Fib I' = 'Retic Fib', 'Retic Fib II' = 'Retic Fib', 'Retic Fib III' = 'Retic Fib')
+coarse <- unname(lookup[reflab])
+prediction <- predict_holdout(expression, coarse, split)
+write.csv(reference_recovery_metrics(prediction, coarse[split$test]), file.path(result_dir, 'celltype_recovery_fibroblast_merged.csv'), row.names = FALSE)
+
+```
+
+### Fibroblast annotation
+
+Merging related anatomical reference subtypes improved recovery but did not capture the functional and cancer-associated fibroblast states observed here. We therefore used marker-based cluster annotations rather than the atlas labels.
+
+```{r fibroblast_annotation}
+
+dictionary <- subtype_dictionary[subtype_dictionary$lineage == 'Fibroblast', ]
+
+# manual annotation
+lookup <- setNames(dictionary$label, as.character(dictionary$cluster))
+sub$Fibroblast_label <- unname(lookup[as.character(sub$Xenium_snn_res.0.8)])
+saveRDS(sub, file.path(intermediate_dir, 'fibroblast_annotated.rds'))
+
+```
+
+### Lymphocyte clustering
+
+```{r lymphocyte_clustering}
+
+# lymphocyte cells
+sub <- subset(obj, cells = colnames(obj)[obj$main_lineage == 'Lymphocyte'])
+features_use <- names(which(Matrix::rowMeans(LayerData(sub, assay = 'Xenium', layer = 'counts') > 0) >= 0.05))
+
+# PCA
+sub <- RunPCA(sub, features = features_use, npcs = 30, seed.use = 42, verbose = FALSE)
+
+# clusters
+sub <- FindNeighbors(sub, dims = 1:10, verbose = FALSE)
+sub <- FindClusters(sub, resolution = 0.8, algorithm = 1, random.seed = 0, verbose = FALSE)
+
+```
+
+### Lymphocyte reference recovery
+
+```{r lymphocyte_reference_recovery}
+
+# lymphocyte recovery
+selected <- which(atlas_labels %in% c('CD8+ Tc', 'CD4+ Th', 'CD4+ Treg', 'Naïve T', 'Plasma'))
+expression <- as.matrix(ref[, selected])
+reflab <- atlas_labels[selected]
+split <- reference_holdout(expression, reflab)
+prediction <- predict_holdout(expression, reflab, split)
+write.csv(reference_recovery_metrics(prediction, reflab[split$test]), file.path(result_dir, 'celltype_recovery_lymphocytes.csv'), row.names = FALSE)
+
+# merged lymphocyte recovery
+lookup <- c('CD8+ Tc' = 'T.CD8', 'CD4+ Th' = 'T.CD4', 'CD4+ Treg' = 'T.CD4', 'Plasma' = 'B.Lymphocyte', 'Naïve T' = 'T.Naive')
+coarse <- unname(lookup[reflab])
+prediction <- predict_holdout(expression, coarse, split)
+metrics <- reference_recovery_metrics(prediction, coarse[split$test])
+write.csv(metrics, file.path(result_dir, 'celltype_recovery_lymphocytes_merged.csv'), row.names = FALSE)
+
+```
+
+### Lymphocyte annotation
+
+Reference recovery was insufficient, so lymphocyte subtypes were assigned from cluster markers, including T-cell, NK, B-cell and cycling programs. Cluster 13 was identified as fibroblasts from COL6A1/PDGFRA/CCL19 expression with little CD3E; its reassignment is completed in notebook 04.
+
+```{r lymphocyte_annotation}
+
+dictionary <- subtype_dictionary[subtype_dictionary$lineage == 'Lymphocyte', ]
+
+# manual annotation
+lookup <- setNames(dictionary$label, as.character(dictionary$cluster))
+sub$lymphocyte_label <- unname(lookup[as.character(sub$Xenium_snn_res.0.8)])
+saveRDS(sub, file.path(intermediate_dir, 'lymphocyte_annotated.rds'))
+
+```
+
+### Epithelial clustering
+
+```{r epithelial_clustering}
+
+# epithelial cells
+sub <- subset(obj, cells = colnames(obj)[obj$main_lineage == 'Epithelial'])
+features_use <- names(which(Matrix::rowMeans(LayerData(sub, assay = 'Xenium', layer = 'counts') > 0) >= 0.05))
+
+# PCA
+sub <- RunPCA(sub, features = features_use, npcs = 30, seed.use = 42, verbose = FALSE)
+
+# clusters
+sub <- FindNeighbors(sub, dims = 1:10, verbose = FALSE)
+sub <- FindClusters(sub, resolution = 0.8, algorithm = 1, random.seed = 0, verbose = FALSE)
+
+```
+
+### Epithelial reference recovery
+
+Similar spinous/granular keratinocyte, infundibulum and outer-root-sheath labels were merged to improve reference recovery. Transfer was then retained, with marker-based overrides for melanoma (cluster 16), cycling keratinocytes (22) and suprabasal keratinocytes (13).
+
+```{r epithelial_reference_recovery}
+
+# epithelial reference
+subtypes <- c('Bas KC', 'Spn KC I', 'Spn KC II', 'Grn KC', 'Cyc KC', 'Bas Inf', 'Diff Inf', 'ORS Basal', 'ORS Suprabasal', 'IRS/HS', 'Bulge', 'Ecc Duct', 'Ecc Gland')
+selected <- which(atlas_labels %in% subtypes)
+reflab <- atlas_labels[selected]
+refM <- as.matrix(ref[, selected])
+
+# held-out cells
+split <- reference_holdout(refM, reflab)
+prediction <- predict_holdout(refM, reflab, split)
+metrics <- reference_recovery_metrics(prediction, reflab[split$test])
+write.csv(metrics, file.path(result_dir, 'celltype_recovery_epithelial.csv'), row.names = FALSE)
+
+# merged epithelial labels
+lookup <- c('Bas KC' = 'Bas KC', 'Bas Inf' = 'Infundibulum', 'Diff Inf' = 'Infundibulum', 'Cyc KC' = 'Cyc KC', 'Spn KC I' = 'Spn KC', 'Spn KC II' = 'Spn KC', 'Grn KC' = 'Spn KC', 'Bulge' = 'Bulge', 'ORS Basal' = 'ORS', 'ORS Suprabasal' = 'ORS', 'Ecc Duct' = 'Ecc Duct', 'Ecc Gland' = 'Ecc Gland', 'IRS/HS' = 'IRS')
+coarse <- unname(lookup[reflab])
+prediction <- predict_holdout(refM, coarse, split)
+metrics <- reference_recovery_metrics(prediction, coarse[split$test])
+write.csv(metrics, file.path(result_dir, 'celltype_recovery_epithelial_merged.csv'), row.names = FALSE)
+
+```
+
+### Epithelial annotation
+
+```{r epithelial_annotation}
+
+atlas <- list(expression = refM, labels = coarse, atlas_index = selected)
+
+# cluster projection
+expression <- LayerData(sub, assay = 'Xenium', layer = 'data')
+common <- intersect(rownames(expression), rownames(atlas$expression))
+prediction <- SingleR(test = expression[common, ], ref = atlas$expression[common, ], labels = atlas$labels, clusters = sub$Xenium_snn_res.0.8, aggr.ref = TRUE, fine.tune = TRUE)
+lookup <- setNames(prediction$labels, rownames(prediction))
+sub$Epithelial_label <- unname(lookup[as.character(sub$Xenium_snn_res.0.8)])
+sub$Epithelial_label[sub$Xenium_snn_res.0.8 %in% 16] <- 'Melanoma'
+sub$Epithelial_label[sub$Xenium_snn_res.0.8 %in% 22] <- 'Cyc KC'
+sub$Epithelial_label[sub$Xenium_snn_res.0.8 %in% 13] <- 'Spn KC'
+sub$Epithelial_label[sub$Epithelial_label == 'Spn KC'] <- 'Suprabasal KC'
+saveRDS(sub, file.path(intermediate_dir, 'epithelial_annotated.rds'))
+
+```
+
+### Stroma clustering
+
+```{r stroma_clustering}
+
+# stromal cells
+sub <- subset(obj, cells = colnames(obj)[obj$main_lineage == 'Stroma'])
+features_use <- names(which(Matrix::rowMeans(LayerData(sub, assay = 'Xenium', layer = 'counts') > 0) >= 0.05))
+features_use <- setdiff(features_use, 'C11orf96')
+
+# PCA
+sub <- RunPCA(sub, features = features_use, npcs = 30, seed.use = 42, verbose = FALSE)
+
+# clusters
+sub <- FindNeighbors(sub, dims = 1:5, verbose = FALSE)
+sub <- FindClusters(sub, resolution = 0.8, algorithm = 1, random.seed = 0, verbose = FALSE)
+
+```
+
+### Stroma reference recovery
+
+```{r stroma_reference_recovery}
+
+# stromal recovery
+selected <- which(atlas_labels %in% c('Peri', 'SM'))
+expression <- as.matrix(ref[, selected])
+reflab <- atlas_labels[selected]
+split <- reference_holdout(expression, reflab)
+prediction <- predict_holdout(expression, reflab, split)
+write.csv(reference_recovery_metrics(prediction, reflab[split$test]), file.path(result_dir, 'celltype_recovery_stroma.csv'), row.names = FALSE)
+
+```
+
+### Stroma annotation
+
+Reference recovery was insufficient, particularly for smooth muscle. Clusters were therefore annotated from pericyte markers (RGS5/NOTCH3) or smooth-muscle markers (MYH11/ACTA2/TAGLN/SYNPO2/MYL9).
+
+```{r stroma_annotation}
+
+dictionary <- subtype_dictionary[subtype_dictionary$lineage == 'Stroma', ]
+
+# manual annotation
+lookup <- setNames(dictionary$label, as.character(dictionary$cluster))
+sub$Stroma_label <- unname(lookup[as.character(sub$Xenium_snn_res.0.8)])
+saveRDS(sub, file.path(intermediate_dir, 'stroma_annotated.rds'))
+
+```

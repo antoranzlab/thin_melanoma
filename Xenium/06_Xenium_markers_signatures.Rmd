@@ -1,0 +1,419 @@
+---
+title: "Marker genes, public signatures and Kunz validation"
+author: "Asier Antoranz"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+---
+
+Identifies marker genes, compares metaprogrammes with public signatures and the Kunz nevus cohort, and plots their comparisons.
+
+**Inputs:** Objects and results from Xenium notebooks 01–04; marker settings, public signatures and Kunz expression data from `paper_data/Xenium/inputs`; the reference gene panel from `paper_data/Xenium/reference_atlas`.
+
+**Outputs:** Marker and enrichment tables, Kunz scores and comparison panels in `results/`; Kunz embedding coordinates in `data/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+code_root <- 'path_to_code'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                    cache = FALSE, cache.lazy = FALSE, fig.align = 'center')
+knitr::opts_knit$set(root.dir = code_root)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(RColorBrewer)
+library(Seurat)
+library(Matrix)
+library(data.table)
+library(ggplot2)
+
+outdir <- file.path(output_root, 'Xenium')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+data_dir <- file.path(data_root, 'Xenium')
+input_dir <- file.path(data_dir, 'inputs')
+atlas_dir <- file.path(data_root, 'Xenium', 'reference_atlas')
+for (path in c(outdir, intermediate_dir, result_dir)) {
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+}
+options(Seurat.object.assay.version = 'v5', future.globals.maxSize = 50 * 1024^3)
+future::plan('sequential')
+source(file.path(code_root, 'Xenium', 'helpers.R'), local = TRUE)
+melanoma <- readRDS(file.path(intermediate_dir, 'melanoma_analysis.rds'))
+
+```
+
+## Marker genes
+
+### Final annotation markers
+
+```{r final_annotation_markers}
+
+obj <- readRDS(file.path(intermediate_dir, 'annotated.rds'))
+annotations <- readRDS(file.path(intermediate_dir, 'final_annotation.rds'))
+obj$main_lineage <- annotations$main_lineage
+obj$final_label <- annotations$final_label
+
+# balanced samples and marker tests
+settings <- data.frame(field = c('main_lineage', 'final_label'), per_label = c(2500, 500),
+                       suffix = c('final_main_lineages', 'final_labels'))
+for (i in seq_len(nrow(settings))) {
+  Idents(obj) <- settings$field[i]
+  set.seed(1234)
+  cells <- unlist(lapply(levels(Idents(obj)), function(label) {
+    available <- WhichCells(obj, idents = label)
+    sample(available, min(length(available), settings$per_label[i]))
+  }))
+  obj_sub <- subset(obj, cells = cells)
+  markers <- FindAllMarkers(obj_sub, assay = 'Xenium', layer = 'data', only.pos = TRUE,
+                            logfc.threshold = 0.25, min.pct = 0.25, test.use = 'wilcox', random.seed = 1)
+  write.csv(markers, file.path(result_dir, paste0('top_markers_', settings$suffix[i], '_diff_exp.csv')), row.names = FALSE)
+}
+
+```
+
+```{r marker_expression_function}
+
+marker_expression <- function(obj, features, field) {
+  features <- as.character(features)
+  mat <- GetAssayData(obj, assay = 'Xenium', layer = 'data')[features, , drop = FALSE]
+  groups <- factor(obj[[field]][, 1])
+  avg <- sapply(levels(groups), function(x) Matrix::rowMeans(mat[, groups == x, drop = FALSE]))
+  pct <- sapply(levels(groups), function(x) Matrix::rowMeans(mat[, groups == x, drop = FALSE] > 0))
+  df <- expand.grid(gene = features, subtype = levels(groups), stringsAsFactors = FALSE)
+  df$mean_expression <- as.vector(avg)
+  df$fraction_detected <- as.vector(pct)
+  df
+}
+
+```
+
+### Lineage annotation markers
+
+```{r lineage_annotation_markers}
+
+settings <- read.csv(file.path(input_dir, 'lineage_marker_settings.csv'))
+
+# load lineage
+load_lineage <- function(setting) {
+    lineage <- tolower(setting$lineage)
+    obj <- readRDS(file.path(intermediate_dir, paste0(lineage, '_annotated.rds')))
+    Idents(obj) <- setting$field
+    DefaultAssay(obj) <- "Xenium"
+    obj
+}
+
+# marker tests
+analyse_lineage <- function(setting) {
+    print(paste0("Starting ", setting$lineage))
+    obj <- load_lineage(setting)
+    filename <- paste0("top_markers_", setting$reference_stem, "_diff_exp_annotated.csv")
+    markers <- FindAllMarkers(obj, assay = "Xenium", layer = "data", only.pos = TRUE, logfc.threshold = 0.25, min.pct = 0.25, 
+        test.use = "wilcox", random.seed = 1)
+    write.csv(markers, file.path(result_dir, filename), row.names = FALSE)
+    selected <- markers %>% filter(p_val_adj < 0.05, abs(avg_log2FC) > 1) %>% mutate(delta_pct = pct.1 - pct.2) %>% 
+        group_by(cluster) %>% slice_max(delta_pct, n = setting$top_n) %>% ungroup()
+    features <- unique(as.character(selected$gene))
+    df <- marker_expression(obj, features, setting$field)
+    write.csv(selected, file.path(result_dir, paste0("S4_", setting$lineage, "_selected_markers.csv")), row.names = FALSE)
+    write.csv(df, file.path(result_dir, paste0("S4_", setting$lineage, "_expression.csv")), row.names = FALSE)
+}
+
+# run marker tests for each configured lineage
+for (i in seq_len(nrow(settings))) {
+    analyse_lineage(settings[i, ])
+    gc()
+}
+
+```
+
+### Metaprogram marker expression
+
+```{r metaprogram_marker_expression}
+
+membership <- read.csv(file.path(result_dir, 'melanoma_metaprogram_genes.csv'))
+
+# positive markers
+Idents(melanoma) <- 'metaprogram_modulescore_stress_subtype'
+DefaultAssay(melanoma) <- 'Xenium'
+markers <- FindAllMarkers(melanoma, assay = 'Xenium', layer = 'data', only.pos = TRUE, logfc.threshold = 0.25, min.pct = 0.25, test.use = 'wilcox', random.seed = 1)
+path <- file.path(result_dir, 'top_markers_melanoma_metaprograms_diff_exp.csv')
+write.csv(markers, path, row.names = FALSE)
+
+# panel genes
+program_order <- c('comm2', 'comm5', 'comm4', 'comm1', 'comm7', 'comm6', 'comm3')
+selected <- inner_join(markers, membership, by = c('cluster' = 'community', 'gene')) %>%
+  filter(pct.1 >= 0.25, p_val_adj < 0.05) %>% group_by(cluster) %>% slice_max(avg_log2FC, n = 4, with_ties = FALSE) %>% ungroup() %>%
+  mutate(cluster = factor(cluster, levels = program_order)) %>% arrange(cluster, desc(avg_log2FC))
+features <- as.character(selected$gene)
+write.csv(selected, file.path(result_dir, 'Figure_2C_selected_markers.csv'), row.names = FALSE)
+
+# expression summaries
+expression <- GetAssayData(melanoma, assay = 'Xenium', layer = 'data')[features, , drop = FALSE]
+linear <- expression
+linear@x <- expm1(linear@x)
+programs <- unique(selected$metaprogram)
+avg <- sapply(programs, function(x) Matrix::rowMeans(linear[, melanoma$melanoma_mp == x, drop = FALSE]))
+pct <- sapply(programs, function(x) 100 * Matrix::rowMeans(expression[, melanoma$melanoma_mp == x, drop = FALSE] > 0))
+z <- t(scale(t(log1p(avg))))
+values <- expand.grid(gene = features, program = programs, stringsAsFactors = FALSE)
+values$mean_normalized <- as.vector(avg)
+values$pct <- as.vector(pct)
+values$zscore_log1p_mean <- as.vector(z)
+write.csv(values, file.path(result_dir, 'Figure_2C_marker_expression.csv'), row.names = FALSE)
+
+```
+
+## Public signatures and the Kunz nevus cohort
+
+### Public signature comparisons
+
+```{r public_signature_comparisons}
+
+library(tidyr)
+library_path <- file.path(input_dir, 'signature_library_long.csv')
+background <- toupper(readLines(file.path(atlas_dir, 'panel_genes.txt')))
+
+# gene sets
+library <- read.csv(library_path)
+signatures <- library %>% filter(source %in% c('harmonized', 'msigdb_hallmark', 'gavish_2023', 'curated_melanoma')) %>%
+  mutate(gene_id = toupper(trimws(gene_id)), sig_id = paste(study, signature, sep = ' | ')) %>% distinct(study, signature, sig_id, gene_id)
+sizes <- signatures %>% group_by(study, signature, sig_id) %>% summarise(N_total = n_distinct(gene_id), N_panel = n_distinct(gene_id[gene_id %in% background]), .groups = 'drop')
+own <- membership %>% transmute(in_metaprogram = community, gene_id = toupper(trimws(gene))) %>% distinct()
+own_sizes <- own %>% count(in_metaprogram, name = 'M')
+
+# direct comparisons
+overlap <- inner_join(filter(signatures, gene_id %in% background), own, by = 'gene_id', relationship = 'many-to-many') %>%
+  group_by(sig_id, in_metaprogram) %>% summarise(N = n_distinct(gene_id), .groups = 'drop')
+direct <- crossing(sig_id = sizes$sig_id, in_metaprogram = own_sizes$in_metaprogram) %>%
+  left_join(overlap, by = c('sig_id', 'in_metaprogram')) %>% mutate(N = replace_na(N, 0L)) %>% left_join(sizes, by = 'sig_id') %>% left_join(own_sizes, by = 'in_metaprogram') %>%
+  mutate(U = length(background), dice = 2 * N / (M + N_panel), p_hyper = phyper(N - 1, M, U - M, N_panel, lower.tail = FALSE), FDR = p.adjust(p_hyper, 'BH'))
+write.csv(direct, file.path(result_dir, 'direct_overlap_all.csv'), row.names = FALSE)
+
+# pairwise comparisons
+sets <- bind_rows(signatures %>% filter(gene_id %in% background) %>% transmute(set_id = sig_id, gene_id), own %>% transmute(set_id = paste0('Own | ', in_metaprogram), gene_id)) %>% distinct()
+ids <- sets %>% distinct(set_id) %>% arrange(set_id) %>% pull(set_id)
+B <- sparseMatrix(i = match(sets$set_id, ids), j = match(sets$gene_id, background), x = 1, dims = c(length(ids), length(background)), dimnames = list(ids, background))
+overlap <- as.matrix(B %*% t(B))
+size <- Matrix::rowSums(B)
+index <- which(upper.tri(overlap), arr.ind = TRUE)
+pairs <- data.frame(from = ids[index[, 1]], to = ids[index[, 2]], N_overlap = overlap[index], K_from = unname(size[index[, 1]]), K_to = unname(size[index[, 2]])) %>%
+  mutate(dice = 2 * N_overlap / (K_from + K_to), p_hyper = phyper(N_overlap - 1, K_from, length(background) - K_from, K_to, lower.tail = FALSE), FDR = p.adjust(p_hyper, 'BH'))
+write.csv(pairs, file.path(result_dir, 'pairwise_enrichment_all.csv'), row.names = FALSE)
+
+write.csv(mutate(signatures, in_panel = gene_id %in% background), file.path(result_dir, 'reference_gene_memberships.csv'), row.names = FALSE)
+
+```
+
+### Public-signature overlap and enrichment
+
+```{r signature_comparison_figures}
+
+withr::with_preserve_seed(local({
+  # direct heatmap
+  selected <- direct %>% group_by(sig_id) %>% filter(min(FDR) < 0.05) %>% ungroup() %>% mutate(metaprogram_label = paste0(in_metaprogram, ' (M=', M, ')'), stars = case_when(FDR < 0.001 ~ '***', FDR < 0.01 ~ '**', FDR < 0.05 ~ '*', TRUE ~ ''), cell_label = ifelse(N > 0, paste0(N, stars), ''))
+  mat <- selected %>% select(sig_id, metaprogram_label, dice) %>% pivot_wider(names_from = metaprogram_label, values_from = dice, values_fill = 0) %>% tibble::column_to_rownames('sig_id') %>% as.matrix()
+  labels <- selected %>% select(sig_id, metaprogram_label, cell_label) %>% pivot_wider(names_from = metaprogram_label, values_from = cell_label, values_fill = '') %>% tibble::column_to_rownames('sig_id') %>% as.matrix()
+  rows <- rownames(mat)[hclust(dist(mat))$order]
+  columns <- colnames(mat)[hclust(dist(t(mat)))$order]
+  mat <- mat[rows, columns]
+  labels <- labels[rows, columns]
+
+  # pairwise heatmap
+  own <- paste0('Own | comm', 1:7)
+  linked <- pairs %>% filter(FDR < 0.1, xor(from %in% own, to %in% own)) %>% transmute(public = ifelse(from %in% own, to, from)) %>% distinct() %>% pull(public)
+  ids <- unique(c(own, linked))
+  similarity <- matrix(0, length(ids), length(ids), dimnames = list(ids, ids))
+  fdr <- matrix(1, length(ids), length(ids), dimnames = list(ids, ids))
+  keep <- pairs %>% filter(from %in% ids, to %in% ids)
+  i <- cbind(match(keep$from, ids), match(keep$to, ids))
+  similarity[i] <- keep$dice
+  similarity[i[, 2:1]] <- keep$dice
+  fdr[i] <- keep$FDR
+  fdr[i[, 2:1]] <- keep$FDR
+  diag(similarity) <- 1
+  diag(fdr) <- 0
+  order <- rownames(similarity)[hclust(as.dist(1 - similarity), method = 'average')$order]
+  similarity <- similarity[order, order]
+  fdr <- fdr[order, order]
+
+  # export signature-network edges and vertices
+  edges <- keep %>% filter(N_overlap > 0, FDR < 0.1)
+  vertices <- data.frame(set_id = ids, set_type = ifelse(ids %in% own, 'Metaprogram', 'Public'))
+  write.csv(edges, file.path(result_dir, 'S5F_signature_network_edges.csv'), row.names = FALSE)
+  write.csv(vertices, file.path(result_dir, 'S5F_signature_network_vertices.csv'), row.names = FALSE)
+
+  library(ComplexHeatmap)
+  library(circlize)
+  library(igraph)
+  library(ggraph)
+  references <- signatures %>% distinct(sig_id, study, signature)
+  short_signature <- function(x) ifelse(grepl('__', x), sub('^.*?__', '', x), sub('^[^_]+_', '', x))
+  save_heatmap <- function(plot, name, width, height) {
+      path <- file.path(result_dir, paste0(name, ".pdf"))
+      pdf(path, width = width, height = height, useDingbats = FALSE)
+      draw(plot, heatmap_legend_side = "right", annotation_legend_side = "right", padding = grid::unit(c(4, 16, 4, 
+          4), "mm"))
+      dev.off()
+  }
+
+  # direct comparison
+  meta <- selected %>% distinct(sig_id, study, signature, N_total, N_panel)
+  meta <- meta[match(rownames(mat), meta$sig_id), ]
+  study_colours <- setNames(colorRampPalette(brewer.pal(8, 'Set2'))(length(unique(meta$study))), sort(unique(meta$study)))
+  main <- Heatmap(mat, name = 'Dice', col = colorRamp2(c(0, max(mat)), c('white', 'indianred')), cluster_rows = FALSE, cluster_columns = FALSE, row_labels = gsub('_', ' ', short_signature(meta$signature)), row_names_side = 'left', row_names_gp = grid::gpar(fontsize = 8), column_names_rot = 45, column_names_gp = grid::gpar(fontsize = 8), rect_gp = grid::gpar(col = 'grey90', lwd = 0.4), cell_fun = function(j, i, x, y, w, h, fill) grid::grid.text(labels[i, j], x, y, gp = grid::gpar(fontsize = 8)))
+  study <- rowAnnotation(Study = meta$study, col = list(Study = study_colours), width = grid::unit(4, 'mm'))
+  coverage <- function(values, name, colours) {
+      matrix <- matrix(values, ncol = 1, dimnames = list(meta$sig_id, name))
+      Heatmap(matrix, name = name, col = colorRamp2(quantile(values, c(0, 0.5, 1)), colours), cluster_rows = FALSE, 
+          cluster_columns = FALSE, show_row_names = FALSE, width = grid::unit(7, "mm"), cell_fun = function(j, i, 
+              x, y, w, h, fill) grid::grid.text(matrix[i, j], x, y, gp = grid::gpar(fontsize = 5.5)))
+  }
+  save_heatmap(main + study + coverage(meta$N_total, 'N', c('grey95', 'grey65', 'grey25')) + coverage(meta$N_panel, 'X', c('grey95', 'skyblue2', 'navy')), 'Figure_2D_public_signature_overlap', 6, 7)
+
+  # pairwise metadata
+  ids <- rownames(similarity)
+  meta <- references[match(ids, references$sig_id), ]
+  meta$sig_id <- ids
+  own <- grepl('^Own \\| ', ids)
+  meta$study[own] <- 'own'
+  meta$signature[own] <- sub('^Own \\| ', '', ids[own])
+  meta$label <- short_signature(meta$signature)
+  sizes <- table(membership$community)
+  meta$label[own] <- paste0(meta$signature[own], ' (M=', sizes[meta$signature[own]], ')')
+  study_colours <- setNames(colorRampPalette(brewer.pal(8, 'Set2'))(length(unique(meta$study))), sort(unique(meta$study)))
+  study_colours['own'] <- '#D55E00'
+
+  # pairwise heatmap
+  annotation <- HeatmapAnnotation(Study = meta$study, col = list(Study = study_colours), show_legend = FALSE)
+  left <- rowAnnotation(Study = meta$study, col = list(Study = study_colours), show_annotation_name = FALSE)
+  font <- grid::gpar(fontsize = 5.5, fontface = ifelse(own, 'bold', 'plain'), col = ifelse(own, 'black', 'grey25'))
+  mat <- similarity
+  plot <- Heatmap(mat, name = 'Dice', col = colorRamp2(c(0, 1), c('white', 'indianred')), cluster_rows = FALSE, cluster_columns = FALSE, row_labels = meta$label, column_labels = meta$label, row_names_gp = font, column_names_gp = font, column_names_rot = 45, column_names_max_height = grid::unit(45, 'mm'), top_annotation = annotation, rect_gp = grid::gpar(col = 'grey90', lwd = 0.25), cell_fun = function(j, i, x, y, w, h, fill) if (i != j && fdr[i, j] < 0.1) grid::grid.text('*', x, y, gp = grid::gpar(fontsize = 7)))
+  save_heatmap(left + plot, 'S5E_signature_similarity', 8, 6)
+
+  # similarity network
+  index <- match(vertices$set_id, meta$sig_id)
+  vertices$study <- meta$study[index]
+  vertices$label <- meta$label[index]
+  graph <- graph_from_data_frame(edges, directed = FALSE, vertices = vertices)
+  set.seed(1234)
+  plot <- ggraph(graph, layout = 'fr') + geom_edge_link(aes(width = dice), alpha = 0.25, colour = 'grey40') +
+    geom_node_point(aes(colour = study, shape = set_type, size = set_type), alpha = 0.95) + geom_node_text(aes(label = label), repel = TRUE, seed = 1234, size = 2.7, max.overlaps = Inf) +
+    scale_colour_manual(values = study_colours, name = 'Study', drop = FALSE) + scale_shape_manual(values = c(Public = 16, Metaprogram = 18), name = NULL) +
+    scale_size_manual(values = c(Public = 2.2, Metaprogram = 6), guide = 'none') + scale_edge_width_continuous(range = c(0.25, 2.2), name = 'Dice') + theme_void() + theme(legend.text = element_text(size = 9))
+  path <- file.path(result_dir, 'S5F_signature_similarity_network.pdf')
+  ggsave(path, plot, width = 9, height = 6, useDingbats = FALSE)
+}))
+
+```
+
+### Kunz validation
+
+```{r kunz_validation}
+
+library(emmeans)
+expression_path <- file.path(input_dir, 'kunz_bulk_expr_symbol.csv')
+metadata_path <- file.path(input_dir, 'kunz_bulk_metadata.csv')
+module_sets <- split(membership$gene, membership$community)
+expression <- read.csv(expression_path, row.names = 'gene')
+metadata <- read.csv(metadata_path) %>% mutate(sample = make.names(sample))
+
+# module scores
+obj <- CreateSeuratObject(counts = expression)
+LayerData(obj, assay = 'RNA', layer = 'data') <- log1p(expression)
+obj <- AddModuleScore(obj, features = module_sets, name = 'MP', seed = 12345)
+scores <- as.matrix(obj[[]][, paste0('MP', seq_along(module_sets))])
+colnames(scores) <- names(module_sets)
+scaled <- scale(scores)
+scaled[scaled > 3] <- 3
+scaled[scaled < -3] <- -3
+states <- names(module_sets)[max.col(scaled, ties.method = 'first')]
+sample_scores <- data.frame(sample = colnames(obj), state = states, scaled)
+sample_scores <- left_join(metadata, sample_scores, by = 'sample')
+
+write.csv(sample_scores, file.path(result_dir, 'kunz_sample_scores_states.csv'), row.names = FALSE)
+patient_scores <- sample_scores %>% pivot_longer(all_of(names(module_sets)), names_to = 'signature', values_to = 'score') %>% group_by(group, patient_id, signature) %>% summarise(score = mean(score), .groups = 'drop')
+write.csv(patient_scores, file.path(result_dir, 'kunz_patient_scores.csv'), row.names = FALSE)
+
+# continuous comparisons
+continuous <- bind_rows(lapply(names(module_sets), function(k) {
+    df <- filter(patient_scores, signature == k)
+    fit <- lm(score ~ group, data = df)
+    result <- as.data.frame(summary(contrast(emmeans(fit, ~group), method = "revpairwise"), infer = c(TRUE, TRUE)))
+    result$signature <- k
+    result$n_melanoma <- sum(df$group == "melanoma")
+    result$n_nevus <- sum(df$group == "nevus")
+    result$mean_melanoma <- mean(df$score[df$group == "melanoma"])
+    result$mean_nevus <- mean(df$score[df$group == "nevus"])
+    result
+}))
+continuous$FDR <- p.adjust(continuous$p.value, 'BH')
+write.csv(continuous, file.path(result_dir, 'kunz_continuous_detailed.csv'), row.names = FALSE)
+
+# dominant states
+tab <- table(sample_scores[c('group', 'state')])
+dominant <- bind_rows(lapply(names(module_sets), function(k) {
+    a <- tab["melanoma", k]
+    b <- sum(tab["melanoma", ]) - a
+    c <- tab["nevus", k]
+    d <- sum(tab["nevus", ]) - c
+    test <- fisher.test(matrix(c(a, b, c, d), 2, byrow = TRUE))
+    data.frame(community = k, melanoma_assigned = a, melanoma_other = b, nevus_assigned = c, nevus_other = d, odds_ratio = unname(test$estimate), 
+        CI_lower = test$conf.int[1], CI_upper = test$conf.int[2], p_value = test$p.value)
+}))
+dominant$FDR <- p.adjust(dominant$p_value, 'BH')
+write.csv(dominant, file.path(result_dir, 'kunz_dominant_detailed.csv'), row.names = FALSE)
+
+```
+
+### Kunz cohort embedding and metaprogram comparisons
+
+```{r kunz_validation_figures}
+
+withr::with_preserve_seed(local({
+  library(umap)
+
+  # embedding
+  set.seed(1234)
+  embedding <- umap(scaled, preserve.seed = TRUE)
+  observed <- data.frame(sample = sample_scores$sample, umap1 = embedding$layout[, 1], umap2 = embedding$layout[, 2])
+  write.csv(observed, file.path(intermediate_dir, 'kunz_embedding.csv'), row.names = FALSE)
+
+  library(tidyr)
+  samples <- left_join(sample_scores, observed, by = 'sample')
+  colours <- c(melanoma = 'orange', nevus = 'dodgerblue')
+
+  # cohort embedding
+  p <- ggplot(samples, aes(umap1, umap2, colour = group)) + geom_point() + theme_bw() + scale_colour_manual(values = colours) +
+    theme(legend.position = "bottom")
+  save_panel(p, 'S5G_Kunz_embedding', 3.2, 3.2)
+
+  # continuous scores
+  continuous$label <- ifelse(continuous$FDR < 0.001, 'FDR < 0.001', sprintf('FDR = %.3f', continuous$FDR))
+  p <- ggplot(patient_scores, aes(group, score, fill = group)) + geom_violin(trim = FALSE) + geom_boxplot(width = 0.10, outlier.shape = NA) +
+    geom_point(position = position_jitter(width = 0.08, seed = 1234), alpha = 0.25, size = 1) + facet_wrap(~signature, nrow = 1) + scale_fill_manual(values = colours) +
+    geom_text(data = continuous, aes(x = 1.5, y = Inf, label = label), inherit.aes = FALSE, vjust = 1.3, size = 3) +
+    theme_bw() + labs(x = NULL, y = 'Metaprogram score') + theme(legend.position = 'none')
+  save_panel(p, 'S5H_Kunz_continuous_scores', 10, 3)
+
+  # dominant states
+  dominant <- dominant %>% mutate(community = factor(community, levels = rev(paste0('comm', 1:7))), melanoma_fraction = melanoma_assigned / (melanoma_assigned + melanoma_other), nevus_fraction = nevus_assigned / (nevus_assigned + nevus_other), FDR_label = case_when(FDR < 0.001 ~ '***', FDR < 0.01 ~ '**', FDR < 0.05 ~ '*', FDR < 0.10 ~ '\u00b7', TRUE ~ ''))
+  long <- dominant %>% select(community, melanoma_fraction, nevus_fraction) %>% pivot_longer(ends_with('_fraction'), names_to = 'group', values_to = 'fraction') %>% mutate(group = sub('_fraction$', '', group))
+  label_x <- max(long$fraction) + 0.04
+  p <- ggplot() + geom_segment(data = dominant, aes(x = nevus_fraction, xend = melanoma_fraction, y = community, yend = community), colour = 'grey70', linewidth = 0.8) +
+    geom_point(data = long, aes(fraction, community, colour = group), size = 3.5) + geom_text(data = dominant, aes(x = label_x, y = community, label = FDR_label), hjust = 0, size = 5) +
+    scale_colour_manual(values = colours) + scale_x_continuous(labels = scales::percent_format(accuracy = 1), expand = expansion(mult = c(0.02, 0.15))) + coord_cartesian(clip = 'off') +
+    theme_bw() + theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(), legend.position = 'top') + labs(x = 'Fraction of samples assigned to state', y = NULL, colour = NULL)
+  save_panel(p, 'S5I_Kunz_dominant_states', 3.2, 3.2)
+}))
+
+```

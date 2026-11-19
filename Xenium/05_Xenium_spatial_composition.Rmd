@@ -1,0 +1,632 @@
+---
+title: "Spatial neighbourhoods, composition and depth"
+author: "Asier Antoranz"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+---
+
+Quantifies cellular neighbourhoods, patient-level composition, concordance between repeated sections and melanoma-cell depth relative to the epidermis.
+
+**Inputs:** Final annotations from Xenium notebook 04, acquisition metadata from notebook 01, and cell coordinates and sample metadata from `paper_data/Xenium`.
+
+**Outputs:** Spatial cell tables, neighbourhood counts, composition models and depth estimates in `data/`; comparisons, summaries and plots in `results/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+code_root <- 'path_to_code'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                    cache = FALSE, cache.lazy = FALSE, fig.align = 'center')
+knitr::opts_knit$set(root.dir = code_root)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(RColorBrewer)
+library(Seurat)
+library(Matrix)
+library(data.table)
+library(ggplot2)
+
+outdir <- file.path(output_root, 'Xenium')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+data_dir <- file.path(data_root, 'Xenium')
+input_dir <- file.path(data_dir, 'inputs')
+raw_dir <- file.path(data_dir, 'raw')
+for (path in c(outdir, intermediate_dir, result_dir)) {
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+}
+options(Seurat.object.assay.version = 'v5', future.globals.maxSize = 50 * 1024^3)
+future::plan('sequential')
+source(file.path(code_root, 'Xenium', 'helpers.R'), local = TRUE)
+
+```
+
+## Spatial coordinates and cellular neighbourhoods
+
+### Xenium spatial inputs
+
+```{r xenium_spatial_inputs}
+
+metadata <- readRDS(file.path(intermediate_dir, 'final_annotation.rds'))
+samples <- read.csv(file.path(input_dir, 'samples.csv'))
+
+# raw centroids
+coordinates <- lapply(seq_len(nrow(samples)), function(i) {
+    path <- file.path(raw_dir, samples$sample_id[i], "cells.csv.gz")
+    x <- fread(path, select = c("cell_id", "x_centroid", "y_centroid"))
+    data.frame(cell = paste(samples$sample_id[i], x$cell_id, sep = "_"), sample_id = samples$sample_id[i], x = x$x_centroid, 
+        y = x$y_centroid)
+})
+coordinates <- bind_rows(coordinates)
+index <- match(rownames(metadata), coordinates$cell)
+coordinates <- coordinates[index, ]
+
+# spatial metadata
+metadata$label_id <- metadata$sample_id
+fields <- c('sample_id', 'final_label', 'patient', 'met', 'pair', 'label_id', 'main_lineage', 'melanoma_mp_labels', 'pt_class', 'pt_route1', 'pt_route2')
+df <- data.frame(cell = rownames(metadata), metadata[, fields], x = coordinates$x, y = coordinates$y)
+df[] <- lapply(df, function(x) if (is.factor(x)) as.character(x) else x)
+spatial_metadata <- df
+path <- file.path(intermediate_dir, 'spatial_cells.csv.gz')
+fwrite(df, path)
+
+```
+
+### Local cellular environments
+
+```{r neighbourhoods}
+
+# 25 nearest non-self neighbours within each acquisition
+spatial_cells <- spatial_metadata %>% filter(!label_id %in% c('thinmme005_1', 'thinmme001_2'))
+neighbour_labels_all <- sort(unique(spatial_cells$final_label))
+reference_cells <- list()
+neighbour_counts <- list()
+for (sample in unique(spatial_cells$sample_id)) {
+  d <- spatial_cells[spatial_cells$sample_id == sample, ]
+  selected <- which(d$main_lineage == 'Melanoma')
+  xy <- as.matrix(d[, c('x', 'y')])
+  neighbours <- RANN::nn2(xy, xy[selected, , drop = FALSE], k = 26)$nn.idx
+  neighbours <- neighbours[, -1, drop = FALSE]
+  codes <- match(d$final_label, neighbour_labels_all)
+  counts <- matrix(0L, length(selected), length(neighbour_labels_all),
+                   dimnames = list(d$cell[selected], neighbour_labels_all))
+  for (j in seq_along(neighbour_labels_all)) {
+    counts[, j] <- rowSums(matrix(codes[neighbours], nrow = length(selected)) == j)
+  }
+  reference_cells[[sample]] <- d[selected, ]
+  neighbour_counts[[sample]] <- counts
+}
+m <- bind_rows(reference_cells)
+counts <- do.call(rbind, neighbour_counts)
+saveRDS(list(metadata = m, counts = counts), file.path(intermediate_dir, 'neighbour_counts.rds'))
+
+# Pool sections within patients; keep zero counts when calculating patient medians.
+profiles <- list()
+for (route in c('Lineage 1', 'Lineage 2')) {
+  pt <- if (route == 'Lineage 1') 'pt_route1' else 'pt_route2'
+  selected <- m$pt_class %in% c('Shared Trunk', route)
+  d <- as.data.table(counts[selected, , drop = FALSE])
+  setnames(d, neighbour_labels_all)
+  d[, patient := m$patient[selected]]
+  d[, bin := floor(m[[pt]][selected] / 0.002)]
+  grouped <- d[, c(list(reference_n = .N), lapply(.SD, sum)),
+               by = .(patient, bin), .SDcols = neighbour_labels_all]
+  grouped <- grouped[reference_n >= 10]
+  long <- melt(grouped, id.vars = c('patient', 'bin', 'reference_n'),
+               variable.name = 'neighbour', value.name = 'N')
+  long[, `:=`(percent = 100 * N / (25 * reference_n), scope = 'all_melanoma',
+              route = route, pt_bin = bin * 0.002 + 0.001)]
+  profiles[[route]] <- long[, .(percent = median(percent), patients = uniqueN(patient),
+                                patients_with_neighbour = sum(N > 0)),
+                            by = .(scope, route, pt_bin, neighbour)]
+}
+neighbour_profiles <- as.data.frame(rbindlist(profiles))
+neighbour_profiles$neighbour <- as.character(neighbour_profiles$neighbour)
+fwrite(neighbour_profiles, file.path(result_dir, 'neighbour_profiles.csv'))
+
+# Enrichment relative to the cell-type background in each acquisition.
+# The 0.5 pseudocount is applied to each of the 42 neighbour labels.
+for (group_by in c('pt_class', 'final_label')) {
+  rows <- list()
+  for (sample in unique(spatial_cells$sample_id)) {
+    d <- spatial_cells[spatial_cells$sample_id == sample, ]
+    background <- table(factor(d$final_label, levels = neighbour_labels_all))
+    expected_fraction <- (as.numeric(background) + 0.5) / (nrow(d) + 0.5 * ncol(counts))
+    for (group in sort(unique(m[[group_by]]))) {
+      selected <- m$sample_id == sample & m[[group_by]] == group
+      n <- sum(selected)
+      if (n == 0) next
+      observed_counts <- colSums(counts[selected, , drop = FALSE])
+      fraction <- (observed_counts + 0.5) / (n * 25 + 0.5 * ncol(counts))
+      rows[[length(rows) + 1]] <- data.frame(sample = sample, group = group,
+        neighbour = neighbour_labels_all, mean_count = observed_counts / n,
+        log2_OE = log2(fraction / expected_fraction))
+    }
+  }
+  by_acquisition <- bind_rows(rows)
+  summary <- by_acquisition %>% group_by(group, neighbour) %>%
+    summarise(mean_count = median(mean_count), log2_OE = median(log2_OE),
+              acquisitions = n_distinct(sample), .groups = 'drop')
+  if (group_by == 'pt_class') {
+    names(summary)[1] <- 'class'
+    lineage_neighbours <- as.data.frame(summary)
+    write.csv(summary, file.path(result_dir, 'lineage_neighbours_metaprogram_labels.csv'), row.names = FALSE)
+  } else {
+    names(summary)[1] <- 'ref_label'
+    metaprogram_neighbours <- as.data.frame(summary)
+    write.csv(summary, file.path(result_dir, 'metaprogram_neighbour_enrichment.csv'), row.names = FALSE)
+  }
+}
+composition <- m %>% count(patient, label_id, pt_class, name = 'cells') %>%
+  group_by(label_id) %>% mutate(percent = 100 * cells / sum(cells)) %>% ungroup()
+write.csv(composition, file.path(result_dir, 'lineage_composition.csv'), row.names = FALSE)
+
+```
+
+```{r local_cellular_environments}
+
+row_order <- c('VEC', 'HEC', 'LEC', 'T.NK', 'T.CD8', 'T.NOS', 'T.CD4', 'T.Naive', 'T.Cycling', 'B.Lymphocyte', 'CCR7+ DC', 'pDC', 'CLEC9A+ DC', 'cDC2', 'LC', 'Mac', 'Mast', 'Fib.FABP4', 'Fib.MFAP5', 'Fib.MMP27', 'Fib.General', 'Fib.LEPR', 'Fib.POSTN', 'Peri', 'SM', 'Bulge', 'Ecc Gland', 'Ecc Duct', 'Bas KC', 'Cyc KC', 'IRS', 'Suprabasal KC', 'Infundibulum', 'ORS', 'Nerves', 'epithelial_adjacent', 'early_developmental_stress', 'proliferation_cell_cycle', 'differentiated_melanocytic', 'ifn_associated_stress', 'nevus_like_senescence', 'mesenchymal_invasive')
+short <- c(epithelial_adjacent = 'Epithelial-adj.', early_developmental_stress = 'Developmental', proliferation_cell_cycle = 'Proliferative', differentiated_melanocytic = 'Melanocytic', ifn_associated_stress = 'IFN-associated', nevus_like_senescence = 'Nevus-like', mesenchymal_invasive = 'MES')
+neighbour_labels <- setNames(row_order, row_order)
+neighbour_labels[names(short)] <- short
+trajectory_cols <- c('Shared Trunk' = '#BDBDBD', 'Lineage 1' = '#E377C2', 'Lineage 2' = '#353C40')
+
+```
+
+### Neighbourhood profiles
+
+```{r neighbourhood_profiles}
+
+# smooth profiles
+groups <- split(neighbour_profiles, interaction(neighbour_profiles$scope, neighbour_profiles$route, neighbour_profiles$neighbour, drop = TRUE))
+curves <- lapply(groups, function(z) {
+    z <- z[order(z$pt_bin), ]
+    fit <- loess(percent ~ pt_bin, data = z, span = 0.75, degree = 2)
+    grid <- seq(min(z$pt_bin), max(z$pt_bin), length.out = 200)
+    data.frame(scope = z$scope[1], route = z$route[1], neighbour = z$neighbour[1], pt_bin = grid, fit = as.numeric(predict(fit, 
+        newdata = data.frame(pt_bin = grid))))
+})
+curves <- bind_rows(curves)
+write.csv(curves, file.path(result_dir, 'neighbour_curves.csv'), row.names = FALSE)
+
+# Figure 2I
+keys <- c('VEC', 'Mac', 'Fib.General', 'T.CD4', 'CLEC9A+ DC', 'Fib.POSTN', 'T.CD8', 'Peri', 'Fib.MMP27', 'differentiated_melanocytic', 'nevus_like_senescence', 'mesenchymal_invasive')
+labels <- c(keys[1:9], 'Melanocytic', 'Nevus-like', 'MES')
+plot_profiles <- neighbour_profiles[neighbour_profiles$neighbour %in% keys, ]
+plot_curves <- curves[curves$neighbour %in% keys, ]
+plot_profiles$neighbour <- factor(plot_profiles$neighbour, levels = keys)
+plot_curves$neighbour <- factor(plot_curves$neighbour, levels = keys)
+p <- ggplot(plot_profiles, aes(pt_bin, percent, colour = route)) + geom_point(size = 0.7, alpha = 0.22) +
+  geom_line(data = plot_curves, aes(y = fit), linewidth = 0.45) + geom_vline(xintercept = 0.056, linetype = 'dashed', linewidth = 0.3, colour = 'grey35') +
+  facet_wrap(~neighbour, ncol = 4, scales = 'free_y', labeller = labeller(neighbour = setNames(labels, keys))) + scale_colour_manual(values = c('Lineage 1' = '#E377C2', 'Lineage 2' = '#353C40')) +
+  scale_x_continuous(limits = c(0, 0.11), breaks = c(0, 0.05, 0.10)) + scale_y_continuous(limits = c(0, NA)) +
+  labs(x = 'Pseudotime', y = 'Neighbours (%)', colour = NULL) + theme_classic(base_size = 9) +
+  theme(legend.position = 'top', strip.background = element_blank(), strip.text = element_text(face = 'bold'))
+path <- file.path(result_dir, "Figure_2I_neighbourhood_profiles.pdf")
+ggsave(path, p, width = 8, height = 6, dpi = 300, bg = "white")
+
+```
+
+### Neighbourhood trajectory contrasts
+
+```{r neighbourhood_trajectory_contrasts}
+
+df <- neighbour_profiles
+
+# common support
+df$bin <- round((df$pt_bin - 0.001) / 0.002)
+common <- Reduce(intersect, split(df$bin, df$route))
+df <- df[df$bin %in% common, ]
+contrast <- tidyr::pivot_wider(df[, c('neighbour', 'bin', 'route', 'percent')], names_from = route, values_from = percent) %>%
+  group_by(neighbour) %>% mutate(denominator = max(pmax(`Lineage 1`, `Lineage 2`)), deltaN = ifelse(denominator > 0, (`Lineage 1` - `Lineage 2`) / denominator, 0)) %>% ungroup()
+contrast$pt_bin <- contrast$bin * 0.002 + 0.001
+write.csv(contrast, file.path(result_dir, 'all_cell_neighbour_evolution.csv'), row.names = FALSE)
+
+# Supplementary Figure 8C
+contrast$neighbour <- factor(contrast$neighbour, levels = rev(row_order))
+p <- ggplot(contrast, aes(pt_bin, neighbour, fill = deltaN)) + geom_tile(width = 0.002, height = 1) +
+  geom_vline(xintercept = 0.056, linetype = 'dashed', linewidth = 0.4) + scale_fill_gradient2(low = '#353C40', mid = 'white', high = '#E377C2', limits = c(-1, 1)) +
+  scale_y_discrete(labels = neighbour_labels) + scale_x_continuous(breaks = c(0.025, 0.05, 0.075), expand = c(0, 0)) +
+  labs(x = 'Pseudotime', y = NULL, fill = 'Normalised\nL1 - L2') + theme_classic(base_size = 9) + theme(axis.ticks.y = element_blank())
+path <- file.path(result_dir, "Supplementary_Figure_8C_neighbourhood_contrasts.pdf")
+ggsave(path, p, width = 6, height = 8, dpi = 300, bg = "white")
+
+```
+
+## Patient composition and metastatic outcome
+
+### Patient cell composition
+
+```{r patient_cell_composition}
+
+df <- spatial_metadata
+
+# acquisition counts
+metadata <- unique(df[, c('label_id', 'pair', 'met', 'patient')])
+labels <- unique(df[, c('final_label', 'main_lineage')])
+counts <- as.data.frame(table(label_id = df$label_id, final_label = df$final_label), stringsAsFactors = FALSE)
+names(counts)[3] <- 'N'
+counts <- counts %>% left_join(metadata, by = 'label_id') %>% left_join(labels, by = 'final_label') %>%
+  group_by(label_id) %>% mutate(M = sum(N), P = 100 * N / M) %>% group_by(label_id, main_lineage) %>% mutate(M2 = sum(N), P2 = 100 * N / M2) %>% ungroup()
+
+# trajectory counts
+melanoma <- df[df$main_lineage == 'Melanoma', ]
+trajectory <- as.data.frame(table(label_id = melanoma$label_id, final_label = melanoma$pt_class), stringsAsFactors = FALSE)
+names(trajectory)[3] <- 'N'
+trajectory <- trajectory %>% left_join(metadata, by = 'label_id') %>% group_by(label_id) %>% mutate(M2 = sum(N), P2 = 100 * N / M2, main_lineage = 'Melanoma_pt') %>% ungroup()
+counts <- bind_rows(counts, trajectory)
+counts$sample_id <- sub('_.*$', '', counts$label_id)
+counts$run <- paste0('run', sub('^.*_', '', counts$label_id))
+write.csv(counts, file.path(result_dir, 'cytometry_final.csv'), row.names = FALSE)
+
+# acquisition QC
+qc <- counts %>% filter(main_lineage == 'Melanoma') %>% distinct(sample_id, run, label_id, patient, M, M2) %>%
+  group_by(patient) %>% mutate(relative_melanoma_yield = M2 / max(M2), low_tumour_coverage = M2 < 1000 & relative_melanoma_yield < 0.25) %>% ungroup()
+write.csv(qc, file.path(result_dir, 'composition_acquisition_qc.csv'), row.names = FALSE)
+retained <- counts %>% left_join(qc[, c('label_id', 'low_tumour_coverage')], by = 'label_id') %>% filter(!low_tumour_coverage)
+
+# patient fractions
+patients <- retained %>% group_by(sample_id, patient, pair, met, main_lineage, final_label) %>% summarise(N = sum(N), .groups = 'drop') %>%
+  group_by(patient, main_lineage) %>% mutate(denominator = sum(N), fraction = N / denominator) %>% ungroup()
+write.csv(patients, file.path(result_dir, 'patient_fractions.csv'), row.names = FALSE)
+
+```
+
+### Paired composition tests
+
+```{r paired_composition_tests}
+
+library(speckle)
+library(limma)
+patients <- as.data.frame(patients)
+metadata <- patients %>% distinct(sample_id, pair, met) %>% mutate(pair = factor(pair), met = factor(met, levels = c('nmet', 'met')))
+
+# paired model
+models <- list()
+tables <- lapply(unique(patients$main_lineage), function(lineage) {
+    d <- patients[patients$main_lineage == lineage, ]
+    index <- rep(seq_len(nrow(d)), d$N)
+    props <- getTransformedProps(clusters = d$final_label[index], sample = d$sample_id[index], transform = "asin")
+    tp <- props$TransformedProps
+    m <- metadata[match(colnames(tp), metadata$sample_id), ]
+    design <- model.matrix(~met + pair, data = m)
+    fit <- eBayes(lmFit(tp, design), robust = nrow(tp) > 2, trend = FALSE)
+    models[[lineage]] <<- list(transformed_proportions = tp, design = design, fit = fit)
+    tt <- topTable(fit, coef = "metmet", number = Inf, sort.by = "none")
+    data.frame(final_label = rownames(tp), main_lineage = lineage, logFC = tt$logFC, t = tt$t, P.Value = tt$P.Value)
+})
+stats <- bind_rows(tables)
+saveRDS(models, file.path(intermediate_dir, 'paired_composition_models.rds'))
+
+# within-compartment correction
+stats <- stats %>% group_by(main_lineage) %>% mutate(FDR = p.adjust(P.Value, 'BH')) %>% ungroup() %>%
+  mutate(direction = ifelse(logFC > 0, 'met', 'nmet'), stars = as.character(cut(FDR, c(-Inf, 0.05, 0.01, 0.001, Inf), labels = c('***', '**', '*', ''))), sig = FDR < 0.05) %>% arrange(main_lineage, P.Value)
+write.csv(stats, file.path(result_dir, 'propeller_within_cyto.csv'), row.names = FALSE)
+
+```
+
+### Acquisition composition panel
+
+```{r acquisition_composition_panel}
+
+# section composition
+df <- as.data.frame(composition)
+df$acquisition <- as.integer(sub('^.*_', '', df$label_id))
+df$section <- paste0(df$patient, ', acquisition ', df$acquisition)
+sections <- df %>% distinct(patient, acquisition, section) %>% arrange(patient, acquisition)
+df$section <- factor(df$section, levels = rev(sections$section))
+df$pt_class <- factor(df$pt_class, levels = names(trajectory_cols))
+p <- ggplot(df, aes(percent, section, fill = pt_class)) + geom_col(width = 0.75, position = position_stack(reverse = TRUE)) +
+  scale_fill_manual(values = trajectory_cols) + scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) +
+  labs(x = 'Melanoma cells (%)', y = NULL, fill = NULL) + theme_classic(base_size = 9) +
+  theme(legend.position = "top", axis.ticks.y = element_blank())
+path <- file.path(result_dir, "Supplementary_Figure_8F_acquisition_composition.pdf")
+ggsave(path, p, width = 7, height = 5.5, dpi = 300, bg = "white")
+
+```
+
+### Trajectory neighbourhoods
+
+```{r trajectory_neighbourhoods}
+
+# trajectory enrichment
+df <- lineage_neighbours
+df$neighbour <- factor(df$neighbour, levels = rev(row_order))
+df$class <- factor(df$class, levels = names(trajectory_cols))
+p <- ggplot(df, aes(class, neighbour, fill = log2_OE)) + geom_tile(colour = 'white', linewidth = 0.25) +
+  geom_text(aes(label = sprintf('%.1f', mean_count), colour = abs(log2_OE) >= 1), size = 2.5) +
+  scale_colour_manual(values = c('FALSE' = 'grey15', 'TRUE' = 'white'), guide = 'none') +
+  scale_fill_gradient2(low = '#2166AC', mid = 'white', high = '#B2182B', limits = c(-2.5, 2.5), oob = scales::squish) +
+  scale_y_discrete(labels = neighbour_labels) + labs(x = NULL, y = NULL, fill = expression(log[2] * '(O/E)')) +
+  theme_classic(base_size = 9) + theme(axis.ticks = element_blank())
+path <- file.path(result_dir, "Supplementary_Figure_8B_trajectory_neighbours.pdf")
+ggsave(path, p, width = 5, height = 8, dpi = 300, bg = "white")
+
+```
+
+### Metaprogram neighbourhood enrichment
+
+```{r metaprogram_neighbourhood_enrichment}
+
+df <- metaprogram_neighbours
+
+# metaprogram heatmap
+programs <- c('epithelial_adjacent', 'early_developmental_stress', 'proliferation_cell_cycle', 'differentiated_melanocytic', 'ifn_associated_stress', 'nevus_like_senescence', 'mesenchymal_invasive')
+df$ref_label <- factor(df$ref_label, levels = programs)
+df$neighbour <- factor(df$neighbour, levels = rev(row_order))
+p <- ggplot(df, aes(ref_label, neighbour, fill = log2_OE)) + geom_tile(colour = 'white', linewidth = 0.25) +
+  geom_text(aes(label = sprintf('%.1f', mean_count), colour = abs(log2_OE) >= 1), size = 2.4) +
+  scale_colour_manual(values = c('FALSE' = 'grey15', 'TRUE' = 'white'), guide = 'none') +
+  scale_fill_gradient2(low = '#2166AC', mid = 'white', high = '#B2182B', limits = c(-2.5, 2.5), oob = scales::squish) +
+  scale_y_discrete(labels = neighbour_labels) + scale_x_discrete(labels = short) +
+  labs(x = NULL, y = NULL, fill = expression(log[2] * '(O/E)')) + theme_classic(base_size = 9) +
+  theme(axis.ticks = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+path <- file.path(result_dir, "Supplementary_Figure_8A_metaprogram_neighbours.pdf")
+ggsave(path, p, width = 7, height = 8, dpi = 300, bg = "white")
+
+```
+
+## Concordance between repeated sections
+
+### Repeat-section permutation test
+
+```{r repeat_section_permutation_test}
+
+df <- as.data.frame(counts) %>% filter(main_lineage != 'Melanoma_pt')
+
+# centred log ratios
+composition_distance <- function(df) {
+    x <- df %>% mutate(run_id = paste(sample_id, run, sep = "_")) %>% group_by(run_id) %>% mutate(prop = P/100, 
+        prop = (prop + 1e-06)/sum(prop + 1e-06)) %>% ungroup() %>%
+      select(run_id, final_label, prop) %>% tidyr::spread(final_label, prop, fill = 1e-06) %>% as.data.frame()
+    rownames(x) <- x$run_id
+    x$run_id <- NULL
+    clr <- t(apply(as.matrix(x), 1, function(v) log(v) - mean(log(v))))
+    list(clr = clr, distance = as.matrix(dist(clr)))
+}
+fit <- composition_distance(df)
+D <- fit$distance
+metadata <- df %>% mutate(run_id = paste(sample_id, run, sep = '_')) %>% distinct(run_id, sample_id, run, patient)
+metadata <- metadata[match(rownames(D), metadata$run_id), ]
+
+# distance 
+index <- combn(seq_len(nrow(D)), 2)
+pairs <- data.frame(run1 = metadata$run_id[index[1, ]], run2 = metadata$run_id[index[2, ]], patient1 = metadata$patient[index[1, ]], patient2 = metadata$patient[index[2, ]], distance = D[cbind(index[1, ], index[2, ])])
+pairs$comparison <- ifelse(pairs$patient1 == pairs$patient2, 'Matched runs', 'Mismatched samples')
+write.csv(pairs, file.path(result_dir, 'section_aitchison_distances.csv'), row.names = FALSE)
+
+# permutation
+mean_within_distance <- function(labels) {
+    groups <- split(seq_along(labels), labels)
+    distances <- unlist(lapply(groups, function(i) {
+        if (length(i) < 2) 
+            return(numeric(0))
+        j <- combn(i, 2)
+        D[cbind(j[1, ], j[2, ])]
+    }))
+    mean(distances)
+}
+observed <- mean_within_distance(metadata$sample_id)
+set.seed(1234)
+permutations <- replicate(100000, mean_within_distance(sample(metadata$sample_id)))
+p_value <- (sum(permutations <= observed) + 1) / (length(permutations) + 1)
+saveRDS(list(clr = fit$clr, distance = D, metadata = metadata, observed = observed, permutations = permutations, p_value = p_value), file.path(intermediate_dir, 'section_permutation.rds'))
+write.csv(data.frame(observed_mean = observed, permutations = length(permutations), seed = 1234, as_or_more_extreme = sum(permutations <= observed), p_value = p_value), file.path(result_dir, 'section_permutation_summary.csv'), row.names = FALSE)
+
+```
+
+### Repeat-section distances
+
+```{r repeat_section_distances}
+
+# labelled matched pairs
+selected <- pairs %>% filter(comparison == 'Matched runs') %>% slice_max(distance, n = 3)
+selected$label <- paste0(selected$patient1, ', ', sub('^.*run', '', selected$run1), ' vs ', sub('^.*run', '', selected$run2))
+maximum <- max(pairs$distance)
+colours <- c('Matched runs' = '#CC79A7', 'Mismatched samples' = 'grey50')
+p <- ggplot(pairs, aes(comparison, distance)) + geom_boxplot(aes(fill = comparison), outlier.shape = NA, width = 0.55, alpha = 0.25) +
+  geom_point(aes(colour = comparison), position = position_jitter(width = 0.12, height = 0, seed = 1234), size = 1.8, alpha = 0.8) +
+  ggrepel::geom_text_repel(data = selected, aes(label = label), size = 2.8, max.overlaps = Inf, seed = 1234) +
+  annotate('segment', x = 1, xend = 2, y = maximum * 1.08, yend = maximum * 1.08) +
+  annotate('text', x = 1.5, y = maximum * 1.15, label = 'Permutation P < 0.0001', size = 3) +
+  scale_fill_manual(values = c('Matched runs' = '#CC79A7', 'Mismatched samples' = 'grey70')) + scale_colour_manual(values = colours) +
+  scale_x_discrete(labels = c('Matched runs' = 'Matched\nruns', 'Mismatched samples' = 'Mismatched\nsamples')) +
+  labs(x = NULL, y = 'Aitchison distance') + theme_classic(base_size = 10) + theme(legend.position = 'none')
+path <- file.path(result_dir, "Supplementary_Figure_8E_section_distances.pdf")
+ggsave(path, p, width = 4.5, height = 5, dpi = 300, bg = "white")
+
+```
+
+## Location relative to the epidermis
+
+```{r epidermal_distance_helpers}
+
+robust_cutoff <- function(x, z = 4, q = 0.985) {
+  x <- x[is.finite(x)]
+  robust <- median(x) + z * 1.4826 * mad(x, constant = 1)
+  min(robust, as.numeric(quantile(x, q)))
+}
+
+clean_depth_reference <- function(df, k = 10) {
+  if (nrow(df) <= k + 1) stop('Too few reference cells; inspect the acquisition.')
+  xy <- as.matrix(df[, c('x', 'y')])
+  radius <- FNN::get.knn(xy, k = k)$nn.dist[, k]
+  df[radius <= robust_cutoff(radius), ]
+}
+
+robust_knn_distance <- function(query, reference, k = 10) {
+  k <- min(k, nrow(reference))
+  distances <- FNN::get.knnx(reference, query, k = k)$nn.dist
+  if (k == 1) as.numeric(distances[, 1]) else apply(distances, 1, median)
+}
+
+```
+
+### Calibrated epidermal depth
+
+```{r calibrated_epidermal_depth}
+
+library(FNN)
+df <- spatial_metadata
+
+# cleaned reference layers
+samples <- unique(df$sample_id)
+results <- list()
+audit <- list()
+for (s in samples) {
+    print(s)
+    d <- df[df$sample_id == s, ]
+    d$x <- d$x - min(d$x) + 1
+    d$y <- d$y - min(d$y) + 1
+    if (max(d$y) > max(d$x)) 
+        d[c("x", "y")] <- d[c("y", "x")]
+    basal <- clean_depth_reference(d[d$final_label == "Bas KC", ])
+    supra <- clean_depth_reference(d[d$final_label == "Suprabasal KC", ])
+    distance <- get.knnx(as.matrix(supra[, c("x", "y")]), as.matrix(basal[, c("x", "y")]), k = 10)$nn.dist[, 1]
+    basal <- basal[distance <= robust_cutoff(distance), ]
+    if (nrow(basal) < 10) 
+        stop("Too few supported basal cells in ", s)
+    target_xy <- as.matrix(d[, c("x", "y")])
+    basal_xy <- as.matrix(basal[, c("x", "y")])
+    supra_xy <- as.matrix(supra[, c("x", "y")])
+    d$distance_clean_basal <- robust_knn_distance(target_xy, basal_xy)
+    d$distance_clean_supra <- robust_knn_distance(target_xy, supra_xy)
+    offset <- median(get.knnx(supra_xy, basal_xy, k = 1)$nn.dist[, 1])
+    d$epidermal_depth <- pmax(d$distance_clean_supra - offset, 0)
+    results[[s]] <- d
+    audit[[s]] <- data.frame(sample_id = s, cells = nrow(d), basal_reference_cells = nrow(basal), suprabasal_reference_cells = nrow(supra), 
+        epidermal_offset = offset)
+}
+
+# depth table
+result <- bind_rows(results)
+path <- file.path(intermediate_dir, 'epidermal_depth.csv.gz')
+fwrite(result, path)
+write.csv(bind_rows(audit), file.path(result_dir, 'epidermal_depth_reference_qc.csv'), row.names = FALSE)
+
+```
+
+### Melanoma depth coverage and its relation to pseudotime
+
+```{r trajectory_depth_evidence}
+
+withr::with_preserve_seed(local({
+  library(ggpubr)
+  route_cols <- c('Shared Trunk' = '#BDBDBD', 'Lineage 1' = '#E377C2', 'Lineage 2' = '#353C40')
+
+  fields <- c('cell', 'patient', 'label_id', 'main_lineage', 'epidermal_depth', 'pt_class', 'pt_route1', 'pt_route2')
+  df <- as.data.frame(result[, fields])
+  bad_runs <- c('thinmme005_1', 'thinmme001_2')
+
+  # summary functions
+  depth_counts <- function(df) {
+      df %>% filter(main_lineage == "Melanoma", !label_id %in% bad_runs, is.finite(epidermal_depth)) %>% mutate(D = floor(epidermal_depth/25) * 
+          25 + 12.5) %>% dplyr::count(patient, D, name = "N") %>% group_by(D) %>% summarise(n_patients = n(), medianN = median(N), 
+          q25 = quantile(N, 0.25), q75 = quantile(N, 0.75), .groups = "drop")
+  }
+  depth_pseudotime <- function(df) {
+      df <- df %>% filter(main_lineage == "Melanoma", !label_id %in% bad_runs, epidermal_depth <= 400) %>% mutate(D = floor(epidermal_depth/10) * 
+          10 + 5)
+      first <- df %>% filter(pt_class != "Lineage 2") %>% group_by(D) %>% summarise(pt = mean(pt_route1), sd_pt = sd(pt_route1), 
+          n = n(), lineage = "Lineage 1", .groups = "drop")
+      second <- df %>% filter(pt_class != "Lineage 1") %>% group_by(D) %>% summarise(pt = mean(pt_route2), sd_pt = sd(pt_route2), 
+          n = n(), lineage = "Lineage 2", .groups = "drop")
+      bind_rows(first, second) %>% mutate(se = sd_pt/sqrt(n), ci_low = pt - 1.96 * se, ci_high = pt + 1.96 * se)
+  }
+
+  # summaries
+  counts <- depth_counts(df)
+  pseudotime <- depth_pseudotime(df)
+
+  # depth associations
+  associations <- bind_rows(lapply(unique(pseudotime$lineage), function(route) {
+      d <- pseudotime %>% filter(lineage == route, D >= 0, D <= 400)
+      test <- cor.test(d$D, d$pt, method = "spearman")
+      data.frame(lineage = route, bins = nrow(d), rho = unname(test$estimate), p_value = test$p.value)
+  }))
+  write.csv(counts, file.path(result_dir, 'S7A_depth_counts.csv'), row.names = FALSE)
+  write.csv(pseudotime, file.path(result_dir, 'S7K_depth_pseudotime.csv'), row.names = FALSE)
+  write.csv(associations, file.path(result_dir, 'S7K_depth_associations.csv'), row.names = FALSE)
+
+  # melanoma depth counts
+  df <- counts
+  p <- ggplot(df, aes(D, medianN)) + geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.18, colour = NA) +
+    geom_line(linewidth = 1) + geom_point(size = 1.8) + xlim(0, 1000) +
+    geom_hline(yintercept = 0, linetype = 'dashed') + geom_vline(xintercept = 400, linetype = 'dashed') +
+    labs(x = 'Distance to basal layer (µm)', y = 'Median number of melanoma cells per patient') + theme_classic(base_size = 11)
+  save_panel(p, 'S7A_melanoma_depth_counts', 5, 4)
+
+  # depth and pseudotime
+  df <- pseudotime
+  p <- ggplot(df, aes(D, pt, colour = lineage, fill = lineage)) + geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.18, colour = NA) +
+    geom_point(size = 1.7) + geom_smooth(method = 'loess', formula = y ~ x) +
+    stat_cor(method = 'spearman', label.x.npc = 0.05, label.y.npc = c(0.96, 0.94), size = 3.5, show.legend = FALSE) +
+    scale_x_continuous(limits = c(0, 400), breaks = seq(0, 400, 100), expand = c(0, 0)) +
+    scale_colour_manual(values = route_cols) + scale_fill_manual(values = route_cols) +
+    labs(x = 'Distance to basal layer (µm)', y = 'Mean pseudotime') + theme_classic(base_size = 10)
+  save_panel(p, 'S7K_depth_pseudotime', 5, 4)
+}))
+
+```
+
+```{r depth_bins}
+
+d <- as.data.frame(result) %>%
+  filter(main_lineage == 'Melanoma', !label_id %in% c('thinmme005_1', 'thinmme001_2'),
+                  is.finite(epidermal_depth), epidermal_depth >= 0) %>%
+  mutate(depth_um = round(asinh(epidermal_depth), 1)) %>% filter(depth_um >= 2, depth_um <= 7)
+# depth_um stores asinh of epidermal depth measured in micrometers.
+support <- d %>% group_by(depth_um) %>%
+  summarise(bin_total = n(), patients_in_bin = n_distinct(patient), .groups = 'drop') %>%
+  filter(bin_total >= 250)
+bins <- d %>% count(depth_um, state = final_label, name = 'cells')
+bins <- tidyr::crossing(depth_um = support$depth_um, state = programs) %>%
+  left_join(bins, by = c('depth_um', 'state')) %>% mutate(cells = replace_na(cells, 0L)) %>%
+  left_join(support, by = 'depth_um') %>% mutate(percent = 100 * cells / bin_total)
+write.csv(bins, file.path(result_dir, 'depth_plot_source_data_asinh.csv'), row.names = FALSE)
+
+```
+
+### Melanoma programs by depth
+
+```{r melanoma_programs_by_depth}
+
+df <- as.data.frame(bins)
+
+# fitted curves
+curves <- lapply(unique(df$state), function(state) {
+    d <- df[df$state == state, ]
+    fit <- loess(percent ~ depth_um, data = d, span = 0.45)
+    grid <- seq(min(d$depth_um), max(d$depth_um), length.out = 200)
+    prediction <- predict(fit, data.frame(depth_um = grid), se = TRUE)
+    delta <- qt(0.975, prediction$df) * prediction$se.fit
+    data.frame(state = state, depth_um = grid, fit = prediction$fit, lower = prediction$fit - delta, upper = prediction$fit + 
+        delta)
+})
+curves <- bind_rows(curves)
+write.csv(curves, file.path(result_dir, 'depth_loess_curves_asinh.csv'), row.names = FALSE)
+
+# Figure 2E
+labels <- c('Epithelial-adjacent', 'Developmental', 'Proliferative', 'Melanocytic', 'IFN-associated', 'Nevus-like', 'Mesenchymal-invasive')
+colours <- setNames(c('#009E73', '#DAA520', '#CD5C5C', '#A52A2A', '#FF7F50', '#D55E00', '#FFC0CB'), labels)
+df$state <- factor(df$state, levels = programs, labels = labels)
+curves$state <- factor(curves$state, levels = programs, labels = labels)
+p <- ggplot(df, aes(depth_um, percent, colour = state)) + geom_point(size = 1) +
+  geom_ribbon(data = curves, aes(y = fit, ymin = lower, ymax = upper, fill = state), alpha = 0.18, colour = NA) +
+  geom_line(data = curves, aes(y = fit), linewidth = 0.6) + facet_wrap(~state, nrow = 1, scales = 'free_y') +
+  scale_colour_manual(values = colours) + scale_fill_manual(values = colours) + scale_x_continuous(limits = c(2, 7), breaks = 2:7) +
+  coord_cartesian(ylim = c(0, NA)) + labs(x = 'asinh(calibrated epidermal depth / micrometre)', y = 'Melanoma cells within depth bin (%)') +
+  theme_classic(base_size = 9) + theme(legend.position = 'none', strip.background = element_blank(), strip.text = element_text(face = 'bold', size = 8))
+path <- file.path(result_dir, "Figure_2E_metaprograms_by_depth.pdf")
+ggsave(path, p, width = 14, height = 3.5, dpi = 300, bg = "white")
+
+```

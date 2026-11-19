@@ -1,0 +1,314 @@
+---
+title: "Combined annotations and reassigned melanoma cells"
+author: "Asier Antoranz"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+---
+
+Combines the lineage and subtype annotations, reassigns selected cells, and projects newly identified melanoma cells onto the metaprogrammes and trajectories.
+
+**Inputs:** Objects and models from Xenium notebooks 01–03, plus lineage and outlier-coordinate dictionaries in `paper_data/Xenium/inputs`.
+
+**Outputs:** Reconciled annotations and projected melanoma cells in `data/`, including `final_annotation.rds`; reassignment counts and the final melanoma embedding in `results/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+code_root <- 'path_to_code'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                    cache = FALSE, cache.lazy = FALSE, fig.align = 'center')
+knitr::opts_knit$set(root.dir = code_root)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(RColorBrewer)
+library(Seurat)
+library(Matrix)
+library(data.table)
+library(ggplot2)
+library(ggrastr)
+library(ggrepel)
+
+outdir <- file.path(output_root, 'Xenium')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+data_dir <- file.path(data_root, 'Xenium')
+input_dir <- file.path(data_dir, 'inputs')
+for (path in c(outdir, intermediate_dir, result_dir)) {
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+}
+options(Seurat.object.assay.version = 'v5', future.globals.maxSize = 50 * 1024^3)
+future::plan('sequential')
+source(file.path(code_root, 'Xenium', 'helpers.R'), local = TRUE)
+
+```
+
+## Combine the annotations
+
+### Reconcile lineage annotations
+
+```{r reconcile_lineage_annotations}
+
+obj <- readRDS(file.path(intermediate_dir, 'annotated.rds'))
+metadata <- obj[[]]
+metadata$main_lineage <- as.character(metadata$main_lineage)
+rm(obj)
+gc()
+
+# annotation sources
+files <- c('myeloid_annotated.rds', 'endothelial_annotated.rds', 'fibroblast_annotated.rds', 'lymphocyte_annotated.rds', 'epithelial_annotated.rds', 'stroma_annotated.rds')
+fields <- c('Myeloid_label', 'Endothelial_label', 'Fibroblast_label', 'Lymphocyte_label', 'Epithelial_label', 'Stroma_label')
+source_fields <- c('Myeloid_label', 'Endothelial_label', 'Fibroblast_label', 'lymphocyte_label', 'Epithelial_label', 'Stroma_label')
+cluster_fields <- c('Myeloid_cluster', 'Endothelial_cluster', 'Fibroblast_cluster', 'Lymphocytic_cluster', 'Epithelial_cluster', 'Stroma_cluster')
+outside <- c('Non.Myeloid', 'Non.Endothelial', 'Non.Fibroblast', 'Non.Lymphocytic', 'Non.Epithelial', 'Non.Stroma')
+
+# join annotations
+for (i in seq_along(files)) {
+    annotation <- readRDS(file.path(intermediate_dir, files[i]))
+    if (files[i] == 'fibroblast_annotated.rds') fib_data <- LayerData(annotation, assay = 'Xenium', layer = 'data')
+    if (files[i] == 'lymphocyte_annotated.rds') lym_data <- LayerData(annotation, assay = 'Xenium', layer = 'data')
+    if (inherits(annotation, "Seurat")) 
+        annotation <- annotation[[]]
+    cells <- if ("cell_id" %in% names(annotation)) 
+        annotation$cell_id
+    else rownames(annotation)
+    clusters <- if ("cluster" %in% names(annotation)) 
+        annotation$cluster
+    else annotation$Xenium_snn_res.0.8
+    index <- match(cells, rownames(metadata))
+    metadata[[fields[i]]] <- outside[i]
+    metadata[[cluster_fields[i]]] <- outside[i]
+    metadata[[fields[i]]][index] <- as.character(annotation[[source_fields[i]]])
+    metadata[[cluster_fields[i]]][index] <- as.character(clusters)
+}
+rm(annotation)
+gc()
+
+# B-cell reassignment
+b_cells <- which(metadata$Myeloid_label == 'B.Lymphocyte')
+metadata$main_lineage[b_cells] <- 'Lymphocyte'
+metadata$Lymphocyte_label[b_cells] <- 'B.Lymphocyte'
+metadata$Myeloid_label[b_cells] <- 'Non.Myeloid'
+metadata$Myeloid_cluster[b_cells] <- 'Non.Myeloid'
+
+# fibroblast subtype centroids
+common <- intersect(rownames(fib_data), rownames(lym_data))
+fib_labels <- metadata[colnames(fib_data), 'Fibroblast_label']
+subtypes <- setdiff(unique(fib_labels), c('Non.Fibroblast', NA))
+centroids <- sapply(subtypes, function(label) Matrix::rowMeans(fib_data[common, which(fib_labels == label), drop = FALSE]))
+
+# reassign fibroblast-labeled cells from the lymphocyte subset
+cells <- rownames(metadata)[metadata$Lymphocyte_label == 'Fibroblast']
+cells <- intersect(cells, colnames(lym_data))
+correlations <- cor(as.matrix(lym_data[common, cells, drop = FALSE]), centroids)
+calls <- colnames(correlations)[max.col(correlations, ties.method = 'first')]
+metadata[cells, 'main_lineage'] <- 'Fibroblast'
+metadata[cells, 'Fibroblast_label'] <- calls
+metadata[cells, 'Lymphocyte_label'] <- 'Non.Lymphocytic'
+metadata[cells, 'Lymphocytic_cluster'] <- 'Non.Lymphocytic'
+rm(fib_data, lym_data)
+gc()
+
+# epithelial melanoma and mast cells
+epithelial_melanoma <- rownames(metadata)[metadata$Epithelial_label == 'Melanoma']
+metadata[epithelial_melanoma, 'main_lineage'] <- 'Melanoma'
+metadata[epithelial_melanoma, 'Epithelial_label'] <- 'Non.Epithelial'
+metadata[epithelial_melanoma, 'Epithelial_cluster'] <- 'Non.Epithelial'
+metadata$main_lineage[metadata$main_lineage == 'Mast'] <- 'Myeloid'
+write.csv(data.frame(reassignment = c('Myeloid to B cell', 'Lymphocyte to fibroblast', 'Epithelial to melanoma'), cells = c(length(b_cells), length(cells), length(epithelial_melanoma))), file.path(result_dir, 'lineage_reassignment_counts.csv'), row.names = FALSE)
+
+```
+
+### Metaprograms in reassigned melanoma cells
+
+```{r metaprograms_in_reassigned_melanoma_cells}
+
+cells <- epithelial_melanoma
+mel <- readRDS(file.path(intermediate_dir, 'melanoma_analysis.rds'))
+epi <- readRDS(file.path(intermediate_dir, 'epithelial_annotated.rds'))
+
+# joint scoring population
+cells <- intersect(cells, colnames(epi))
+epi <- subset(epi, cells = cells)
+modules <- mel@misc$metaprogram_gene_sets
+comb <- JoinLayers(merge(mel, y = epi))
+comb <- AddModuleScore(comb, features = modules, name = 'comm', assay = 'Xenium', layer = 'data', ctrl = 5, nbin = 10, seed = 1)
+scores <- as.matrix(comb[[]][cells, paste0('comm', 1:7)])
+colnames(scores) <- names(modules)
+rm(comb, epi)
+gc()
+
+# program calls and scaling frame
+calls <- max.col(scores, ties.method = 'first')
+result <- data.frame(cell_id = cells, metaprogram_modulescore_stress_subtype = paste0('comm', calls), melanoma_mp = names(modules)[calls], scores, check.names = FALSE)
+training <- trajectory_training_view(mel)
+population_scores <- as.matrix(mel[[]][, training$features])
+frame <- list(features = training$features, center = colMeans(population_scores), scale = apply(population_scores, 2, sd))
+
+```
+
+### Project reassigned melanoma cells
+
+```{r project_reassigned_melanoma_cells}
+
+library(destiny)
+library(slingshot)
+input <- list(metadata = result, scaling = frame)
+dm <- mel@misc$trajectory_models$diffusion_map
+fit <- mel@misc$trajectory_models$slingshot
+
+# fixed scaling frame
+scores <- as.matrix(input$metadata[, input$scaling$features])
+rownames(scores) <- input$metadata$cell_id
+scores <- scale(scores, center = input$scaling$center, scale = input$scaling$scale)
+scores[scores > 3] <- 3
+scores[scores < -3] <- -3
+coordinates <- as.matrix(destiny::dm_predict(dm, scores)[, 1:3, drop = FALSE])
+coordinates <- sweep(coordinates, 2, training$signs, '*')
+colnames(coordinates) <- paste0('DC', 1:3)
+rownames(coordinates) <- rownames(scores)
+
+# Slingshot projection
+projected <- slingshot::predict(fit, newdata = coordinates)
+weights <- slingCurveWeights(projected, as.probs = FALSE)
+pt_na <- slingPseudotime(projected, na = TRUE)
+pt <- slingPseudotime(projected, na = FALSE)
+assignment <- ifelse(is.na(pt_na[, 1]), 'Lineage 2', ifelse(is.na(pt_na[, 2]), 'Lineage 1', 'Shared Trunk'))
+result <- data.frame(cell_id = rownames(scores), DM1 = coordinates[, 1], DM2 = coordinates[, 2], DM3 = coordinates[, 3], pt_route1_raw = pt[, 1], pt_route2_raw = pt[, 2], w1 = weights[, 1], w2 = weights[, 2], slingshot_lineage_assignment = assignment)
+
+```
+
+### Correct reassigned melanoma trajectories
+
+```{r correct_reassigned_melanoma_trajectories}
+
+df <- result
+population <- trajectory_cells(mel, 'raw')
+fork <- 0.05608277
+threshold <- 0.0081
+
+# population trunk
+population <- population %>% mutate(pt_route1 = pt_route1_raw, pt_route2 = pt_route2_raw, pt_merged = (pt_route1 + pt_route2) / 2, pt_class = 'Shared Trunk')
+trunk <- make_centerline(population %>% filter(w1 + w2 >= 1.5), 'Shared Trunk', 'pt_merged', n_bins = 70, span = 0.25)
+s <- as.matrix(trunk[, c('pt_route1_s', 'pt_route2_s')])
+projection <- nearest_on_skeleton(as.matrix(df[, c('pt_route1_raw', 'pt_route2_raw')]), s)
+df$pt_route1 <- df$pt_route1_raw
+df$pt_route2 <- df$pt_route2_raw - (projection$pt2_line - projection$pt1_line)
+df <- df %>% mutate(pt_merged = (pt_route1 + pt_route2) / 2, delta = pt_route1 - pt_route2, pt_class = ifelse(pt_merged < fork, 'Shared Trunk', ifelse(w2 < w1, 'Lineage 1', ifelse(w1 < w2, 'Lineage 2', 'Shared Trunk'))))
+
+# population branch skeletons
+projection <- nearest_on_skeleton(as.matrix(population[, c('pt_route1', 'pt_route2')]), s)
+population$pt_route2 <- population$pt_route2 - (projection$pt2_line - projection$pt1_line)
+population <- population %>% mutate(pt_merged = (pt_route1 + pt_route2) / 2, delta = pt_route1 - pt_route2, pt_class = ifelse(pt_merged < fork, 'Shared Trunk', ifelse(w2 < w1, 'Lineage 1', ifelse(w1 < w2, 'Lineage 2', 'Shared Trunk'))))
+skeleton <- bind_rows(make_centerline(population, 'Shared Trunk', 'pt_merged', n_bins = 70, span = 0.25), make_centerline(population, 'Lineage 1', 'pt_route1', n_bins = 90, span = 0.30), make_centerline(population, 'Lineage 2', 'pt_route2', n_bins = 90, span = 0.30))
+
+# outliers
+df$cl_dist <- NA_real_
+for (cl in unique(df$pt_class)) {
+    index <- which(df$pt_class == cl)
+    s <- skeleton[skeleton$pt_class == cl, ]
+    df$cl_dist[index] <- vapply(index, function(i) sqrt(min((s$pt_route1_s - df$pt_route1[i])^2 + (s$pt_route2_s - 
+        df$pt_route2[i])^2)), numeric(1))
+}
+df$cl_far <- df$cl_dist > threshold
+noise_sd <- median(df$cl_dist[!df$cl_far], na.rm = TRUE)
+
+path <- file.path(input_dir, 'epithelial_melanoma_outlier_coordinates.csv')
+retained <- read.csv(path)
+corrected <- correct_trajectory_outliers(list(metadata = df, skeleton = skeleton, noise_sd = noise_sd), retained = retained)
+
+# metadata
+corrected$pt_merged <- df$pt_merged
+corrected$delta <- df$delta
+
+```
+
+### Final Xenium annotations
+
+```{r final_xenium_annotations}
+
+core <- mel[[]]
+
+# melanoma programs
+numeric_fields <- names(modules)
+categorical_fields <- c('metaprogram_modulescore_stress_subtype', 'melanoma_mp')
+for (field in numeric_fields) metadata[[field]] <- NA_real_
+for (field in categorical_fields) metadata[[field]] <- 'Non.Melanoma'
+index <- match(rownames(core), rownames(metadata))
+for (field in numeric_fields) metadata[[field]][index] <- core[[field]]
+for (field in categorical_fields) metadata[[field]][index] <- as.character(core[[field]])
+added <- input$metadata
+index <- match(added$cell_id, rownames(metadata))
+for (field in c(numeric_fields, categorical_fields)) metadata[[field]][index] <- added[[field]]
+
+# trajectories
+numeric_fields <- c('DM1', 'DM2', 'DM3', 'pt_route1_raw', 'pt_route2_raw', 'w1', 'w2', 'pt_route1', 'pt_route2', 'pt_merged', 'delta')
+categorical_fields <- c('slingshot_lineage_assignment', 'pt_class')
+for (field in numeric_fields) metadata[[field]] <- NA_real_
+for (field in categorical_fields) metadata[[field]] <- 'Non.Melanoma'
+trajectories <- list(trajectory_cells(mel), corrected)
+for (trajectory in trajectories) {
+    index <- match(trajectory$cell_id, rownames(metadata))
+    for (field in c(numeric_fields, categorical_fields)) metadata[[field]][index] <- trajectory[[field]]
+}
+
+rm(mel, core, trajectories)
+gc()
+
+# figure labels
+mp_labels <- c(differentiated_melanocytic = 'Differentiated melanocytic', epithelial_adjacent = 'Epithelial-adjacent', mesenchymal_invasive = 'Mesenchymal invasive', proliferation_cell_cycle = 'Proliferation/cell cycle', early_developmental_stress = 'Early developmental stress', nevus_like_senescence = 'Nevus-like senescence', ifn_associated_stress = 'IFN-associated stress')
+metadata$melanoma_mp_labels <- 'Non.Melanoma'
+melanoma <- metadata$main_lineage == 'Melanoma'
+metadata$melanoma_mp_labels[melanoma] <- unname(mp_labels[metadata$melanoma_mp[melanoma]])
+metadata$final_label <- metadata$main_lineage
+fields <- c(Epithelial = 'Epithelial_label', Fibroblast = 'Fibroblast_label', Lymphocyte = 'Lymphocyte_label', Myeloid = 'Myeloid_label', Endothelial = 'Endothelial_label', Stroma = 'Stroma_label', Melanoma = 'melanoma_mp')
+for (lineage in names(fields)) {
+    selected <- metadata$main_lineage == lineage
+    metadata$final_label[selected] <- metadata[[fields[[lineage]]]][selected]
+}
+dictionary <- read.csv(file.path(input_dir, 'first_level_lineage_dictionary.csv'))
+mast_clusters <- dictionary$cluster[dictionary$main_lineage == 'Mast']
+metadata$final_label[metadata$seurat_clusters_split %in% mast_clusters] <- 'Mast'
+
+```
+
+### Metaprograms in the final melanoma embedding
+
+```{r melanoma_metaprogram_embedding}
+
+withr::with_preserve_seed(local({
+  mp_pal <- c(differentiated_melanocytic = '#A52A2A', epithelial_adjacent = '#009E73', mesenchymal_invasive = '#FFC0CB', proliferation_cell_cycle = '#CD5C5C', early_developmental_stress = '#DAA520', nevus_like_senescence = '#D55E00', ifn_associated_stress = '#FF7F50')
+
+  path <- file.path(input_dir, 'melanoma_umap.csv')
+
+  df <- read.csv(path)
+  df$metaprogram <- metadata$melanoma_mp[match(df$cell_id, rownames(metadata))]
+
+  # embedding panel
+  labels <- c(differentiated_melanocytic = 'Melanocytic', epithelial_adjacent = 'Epithelial-adjacent', mesenchymal_invasive = 'MES', proliferation_cell_cycle = 'Proliferative', early_developmental_stress = 'Developmental', nevus_like_senescence = 'Nevus-like', ifn_associated_stress = 'IFN-associated')
+  centres <- df %>% group_by(metaprogram) %>% summarise(umap1 = median(umap1), umap2 = median(umap2), .groups = 'drop')
+  centres$label <- labels[as.character(centres$metaprogram)]
+  p <- ggplot(df, aes(umap1, umap2, colour = metaprogram)) + geom_point_rast(size = 0.3, raster.dpi = 300) +
+    geom_label_repel(data = centres, aes(label = label), seed = 1234, size = 3, colour = "black") +
+    scale_colour_manual(values = mp_pal) + theme_classic() + theme(legend.position = 'none') + labs(x = 'UMAP 1', y = 'UMAP 2')
+  output <- file.path(result_dir, 'Figure_2B_melanoma_embedding.pdf')
+  ggsave(output, p, width = 5, height = 5, useDingbats = FALSE)
+}))
+
+```
+
+### Save the final annotations
+
+```{r save_final_annotations}
+
+saveRDS(metadata, file.path(intermediate_dir, 'final_annotation.rds'))
+
+```

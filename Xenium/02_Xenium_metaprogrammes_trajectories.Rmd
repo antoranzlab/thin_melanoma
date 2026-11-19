@@ -1,0 +1,763 @@
+---
+title: "Melanoma metaprogrammes and trajectories"
+author: "Asier Antoranz"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+---
+
+Identifies melanoma metaprogrammes, scores individual cells and infers the two melanoma trajectories.
+
+**Inputs:** Annotated cells from Xenium notebook 01 and the trajectory-outlier coordinates in `paper_data/Xenium/inputs`.
+
+**Outputs:** Metaprogramme gene sets, scored melanoma cells, diffusion-map and Slingshot models, and corrected trajectories in `data/`; gene lists, summary tables and discovery/trajectory figures in `results/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+code_root <- 'path_to_code'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                    cache = FALSE, cache.lazy = FALSE, fig.align = 'center')
+knitr::opts_knit$set(root.dir = code_root)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(RColorBrewer)
+library(Seurat)
+library(Matrix)
+library(data.table)
+library(ggplot2)
+library(ggrastr)
+library(ggrepel)
+
+outdir <- file.path(output_root, 'Xenium')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+data_dir <- file.path(data_root, 'Xenium')
+input_dir <- file.path(data_dir, 'inputs')
+for (path in c(outdir, intermediate_dir, result_dir)) {
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+}
+options(Seurat.object.assay.version = 'v5', future.globals.maxSize = 50 * 1024^3)
+future::plan('sequential')
+source(file.path(code_root, 'Xenium', 'helpers.R'), local = TRUE)
+
+```
+
+## Melanoma metaprogrammes
+
+```{r gene_network_helpers}
+
+library(igraph)
+library(tidygraph)
+
+## We check the strength of association of two genes by checking the number of cells where both genes are coexpressed relative to the individual expression of each gene (kappa stat)
+co_detection_kappa <- function(counts) {
+  detected <- counts > 0
+  n <- ncol(detected)
+  positive <- Matrix::rowSums(detected)
+  negative <- n - positive
+  both <- as.matrix(detected %*% Matrix::t(detected))
+  neither <- n - outer(positive, rep(1, length(positive))) - outer(rep(1, length(positive)), positive) + both
+  expected <- (outer(positive, positive) + outer(negative, negative)) / n^2
+  observed <- (both + neither) / n
+  (observed - expected) / (1 - expected)
+}
+
+find_gene_communities <- function(graph, seed) {
+  set.seed(seed)
+  graph <- tidygraph::as_tbl_graph(graph) %>% mutate(community = as.factor(tidygraph::group_louvain(weights = weight)))
+  tibble::as_tibble(graph) %>% transmute(gene = name, community = as.character(community))
+}
+
+community_metrics <- function(graph, communities) {
+  lookup <- setNames(paste0('comm', communities$community), communities$gene)
+  edges <- igraph::as_data_frame(graph, what = 'edges')
+  from <- unname(lookup[edges$from])
+  to <- unname(lookup[edges$to])
+  metrics <- lapply(sort(unique(lookup)), function(community) {
+    n <- sum(lookup == community)
+    internal <- from == community & to == community
+    external <- xor(from == community, to == community)
+    iw <- sum(edges$weight[internal])
+    ew <- sum(edges$weight[external])
+    pi <- n * (n - 1) / 2
+    pe <- n * (igraph::vcount(graph) - n)
+    data.frame(community = community, n_genes = n, possible_internal_edges = pi, possible_external_edges = pe, internal_edges = sum(internal), external_edges = sum(external), internal_weight = iw, external_weight = ew, internal_edge_density = sum(internal) / pi, external_edge_density = sum(external) / pe, internal_weighted_density = iw / pi, external_weighted_density = ew / pe, intra_external_ratio = (iw / pi) / (ew / pe), conductance = ew / (2 * iw + ew), internal_weight_fraction = iw / (iw + ew)) })
+  bind_rows(metrics) %>% arrange(desc(conductance))
+}
+
+```
+
+### Melanoma metaprograms
+
+```{r melanoma_metaprograms}
+
+# initial melanoma population
+obj <- readRDS(file.path(intermediate_dir, 'annotated.rds'))
+mel <- obj[, colnames(obj)[obj$main_lineage == 'Melanoma']]
+rm(obj)
+gc()
+
+# calculate gene co-detection and its threshold
+kappa <- co_detection_kappa(LayerData(mel, assay = 'Xenium', layer = 'counts'))
+threshold <- round(mean(kappa[kappa < 1]) + 2.3 * sd(kappa[kappa < 1]), 2)
+write.csv(data.frame(cells = ncol(mel), genes = nrow(mel), threshold = threshold), file.path(result_dir, 'melanoma_graph_parameters.csv'), row.names = FALSE)
+
+```
+
+### Co-detection threshold
+
+```{r kappa_threshold_panel}
+
+withr::with_preserve_seed(local({
+  # threshold
+  values <- kappa[upper.tri(kappa)]
+  df <- data.frame(kappa = values[is.finite(values)])
+  p <- ggplot(df, aes(kappa)) + geom_histogram(bins = 128, fill = 'grey75', colour = 'grey30', linewidth = 0.15) +
+    geom_vline(xintercept = 0.15, linetype = 'dashed', linewidth = 0.7, colour = 'indianred') +
+    annotate('text', x = 0.15, y = Inf, label = 'threshold = 0.15', hjust = -0.05, vjust = 1.5, colour = 'indianred', size = 3.5) +
+    theme_bw(base_size = 11) + labs(x = "Cohen's kappa", y = 'Gene-pair count')
+  save_panel(p, 'S5A_kappa_threshold', 4, 3)
+}))
+
+```
+
+### Initial gene communities
+
+```{r initial_gene_communities}
+
+adjacency <- kappa
+adjacency[adjacency < threshold] <- 0
+graph <- igraph::graph_from_adjacency_matrix(adjacency, mode = 'undirected', weighted = TRUE, diag = FALSE)
+components <- igraph::components(graph)
+graph <- igraph::induced_subgraph(graph, igraph::V(graph)[components$membership == which.max(components$csize)])
+graph <- igraph::induced_subgraph(graph, igraph::V(graph)[igraph::degree(graph) > 1])
+
+# initial communities
+communities <- find_gene_communities(graph, 12345)
+write.csv(communities, file.path(result_dir, 'metaprograms_th15.csv'), row.names = FALSE)
+
+# module connectivity
+metrics <- community_metrics(graph, communities)
+write.csv(metrics, file.path(result_dir, 'melanoma_module_metrics.csv'), row.names = FALSE)
+
+```
+
+### Gene-network plotting
+
+```{r gene_network_plot_helper}
+
+network_panel <- function(graph, membership, name, palette = NULL) {
+    V(graph)$comm <- factor(membership$community[match(V(graph)$name, membership$gene)])
+    set.seed(1234)
+    layout <- create_layout(graph, layout = "fr")
+    saveRDS(layout, file.path(intermediate_dir, paste0(name, "_layout.rds")))
+    if (name == "S5B_initial_gene_network") 
+        return(invisible(layout))
+    p <- ggraph(layout) + geom_edge_link(aes(width = weight), alpha = 0.2) +
+      geom_node_point(aes(colour = comm), size = 2) + geom_node_text(aes(label = name), repel = TRUE, seed = 1234, 
+        size = 3, max.overlaps = Inf) +
+      theme_void()
+    if (!is.null(palette)) 
+        p <- p + scale_colour_manual(values = palette)
+    save_panel(p, name, 6, 5)
+}
+
+```
+
+### Initial gene-network structure and conductance
+
+```{r initial_gene_community_panels}
+
+withr::with_preserve_seed(local({
+  library(ggraph)
+  comm_cols <- setNames(colorRampPalette(brewer.pal(8, 'Set1'))(length(unique(communities$community))), sort(unique(communities$community)))
+  network_panel(graph, communities, 'S5B_initial_gene_network', comm_cols)
+
+  # conductance
+  metrics$community <- factor(metrics$community, levels = paste0('comm', sort(unique(communities$community))))
+  p <- ggplot(metrics, aes(community, conductance, fill = community)) + geom_col() + theme_bw() +
+    geom_text(aes(label = sprintf('%.3f', conductance)), vjust = -0.4, size = 3) +
+    scale_fill_manual(values = setNames(comm_cols, paste0('comm', names(comm_cols)))) + theme(legend.position = 'none') + labs(x = NULL, y = 'Module conductance') +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+  save_panel(p, 'S5C_module_conductance', 4, 2)
+}))
+
+```
+
+### Refine the stress-associated community
+
+```{r refine_stress_community}
+
+# stress communities
+stress_community <- sub('comm', '', metrics$community[which.max(metrics$conductance)])
+stress_genes <- communities$gene[communities$community == stress_community]
+stress_adjacency <- kappa[stress_genes, stress_genes]
+stress_adjacency[stress_adjacency < threshold] <- 0
+stress_graph <- igraph::graph_from_adjacency_matrix(stress_adjacency, mode = 'undirected', weighted = TRUE, diag = FALSE)
+stress <- find_gene_communities(stress_graph, 1)
+write.csv(stress, file.path(result_dir, 'metaprograms_stress_th15.csv'), row.names = FALSE)
+
+```
+
+### Stress-associated gene network
+
+```{r stress_community_panel}
+
+withr::with_preserve_seed(local({
+  library(ggraph)
+  network_panel(stress_graph, stress, 'S5D_stress_gene_network')
+}))
+
+```
+
+### Score the seven metaprograms
+
+```{r score_melanoma_metaprograms}
+
+# seven programs
+final <- bind_rows(communities[communities$community != stress_community, ], transform(stress, community = as.character(as.integer(community) + 100)))
+ids <- sort(unique(as.integer(final$community)))
+final$community <- paste0('comm', match(as.integer(final$community), ids))
+mp_names <- c(comm1 = 'differentiated_melanocytic', comm2 = 'epithelial_adjacent', comm3 = 'mesenchymal_invasive', comm4 = 'proliferation_cell_cycle', comm5 = 'early_developmental_stress', comm6 = 'nevus_like_senescence', comm7 = 'ifn_associated_stress')
+module_sets <- split(final$gene, final$community)[names(mp_names)]
+final$metaprogram <- unname(mp_names[final$community])
+write.csv(final, file.path(result_dir, 'melanoma_metaprogram_genes.csv'), row.names = FALSE)
+
+# module scores
+mel <- AddModuleScore(mel, features = module_sets, name = 'comm', assay = 'Xenium', layer = 'data', ctrl = 5, nbin = 10, seed = 1)
+scores <- as.matrix(mel[[]][, names(mp_names)])
+call <- apply(scores, 1, function(x) names(mp_names)[which.max(x)])
+mel$metaprogram_modulescore_stress_subtype <- call
+mel$melanoma_mp <- factor(unname(mp_names[call]), levels = unname(mp_names))
+mel@meta.data[unname(mp_names)] <- mel@meta.data[names(mp_names)]
+
+```
+
+### Co-detection across the final metaprograms
+
+```{r metaprogram_codetection_panel}
+
+withr::with_preserve_seed(local({
+  library(pheatmap)
+  membership <- final
+
+  # matrix order
+  comms <- sort(unique(membership$community))
+  comm_mat <- outer(comms, comms, Vectorize(function(a, b) mean(kappa[membership$gene[membership$community == a], membership$gene[membership$community == b]])))
+  dimnames(comm_mat) <- list(comms, comms)
+  diag(comm_mat) <- 1
+  comm_order <- comms[hclust(as.dist(1 - comm_mat), method = 'average')$order]
+  genes <- unlist(lapply(comm_order, function(comm) {
+      selected <- membership$gene[membership$community == comm]
+      if (length(selected) > 2) 
+          selected <- selected[hclust(as.dist(1 - kappa[selected, selected]), method = "average")$order]
+      selected
+  }))
+  annotation <- data.frame(Community = membership$community[match(genes, membership$gene)], row.names = genes)
+  gaps <- head(cumsum(rle(annotation$Community)$lengths), -1)
+  palette <- c(comm1 = '#A52A2A', comm2 = '#009E73', comm3 = '#FFC0CB', comm4 = '#CD5C5C', comm5 = '#DAA520', comm6 = '#D55E00', comm7 = '#FF7F50')
+
+  # co-detection matrix
+  path <- file.path(result_dir, 'Figure_2A_gene_codetection.pdf')
+  pdf(path, width = 15, height = 13, useDingbats = FALSE)
+  pheatmap(kappa[genes, genes], display_numbers = ifelse(kappa[genes, genes] > 0.15, '*', ''), cluster_rows = FALSE, cluster_cols = FALSE, annotation_row = annotation, annotation_col = annotation, annotation_colors = list(Community = palette), gaps_row = gaps, gaps_col = gaps, fontsize_row = 6, fontsize_col = 6, border_color = NA)
+  dev.off()
+  write.csv(data.frame(gene = genes, community = annotation$Community), file.path(result_dir, 'Figure_2A_gene_order.csv'), row.names = FALSE)
+}))
+
+```
+
+## Melanoma trajectories
+
+### Trajectory training cells
+
+```{r trajectory_training_cells}
+
+Idents(mel) <- 'melanoma_mp'
+features_use <- as.character(unique(mel$melanoma_mp))
+
+# scale scores
+training_metadata <- mel[[]]
+training_metadata[, features_use] <- scale(training_metadata[, features_use])
+training_metadata[, features_use][training_metadata[, features_use] > 3] <- 3
+training_metadata[, features_use][training_metadata[, features_use] < -3] <- -3
+
+# sample cells
+set.seed(1234)
+cells_use <- unlist(lapply(levels(Idents(mel)), function(program) {
+    cells <- WhichCells(mel, idents = program)
+    sample(cells, size = min(length(cells), 1000))
+}))
+training <- list(metadata = training_metadata[rownames(training_metadata) %in% cells_use, , drop = FALSE], features = features_use, levels = levels(Idents(mel)))
+trajectory_training <- training
+trajectory_training$metadata <- trajectory_training$metadata[, c(trajectory_training$features, 'melanoma_mp'), drop = FALSE]
+rm(training_metadata)
+
+```
+
+```{r trajectory_plot_helpers}
+
+mp_pal <- c(differentiated_melanocytic = '#A52A2A', epithelial_adjacent = '#009E73', mesenchymal_invasive = '#FFC0CB', proliferation_cell_cycle = '#CD5C5C', early_developmental_stress = '#DAA520', nevus_like_senescence = '#D55E00', ifn_associated_stress = '#FF7F50')
+route_cols <- c('Shared Trunk' = '#BDBDBD', 'Lineage 1' = '#E377C2', 'Lineage 2' = '#353C40')
+diffusion_labels <- c(differentiated_melanocytic = 'Differentiated', epithelial_adjacent = 'Epithelial-adjacent', mesenchymal_invasive = 'Mesenchymal', proliferation_cell_cycle = 'Proliferation', early_developmental_stress = 'Early developmental', nevus_like_senescence = 'Nevus-like', ifn_associated_stress = 'IFN stress')
+
+open_panel <- function(name) {
+    path <- file.path(result_dir, paste0(name, ".pdf"))
+    pdf(path, width = 8, height = 7, useDingbats = FALSE)
+}
+
+pad_range <- function(x, fraction) {
+    r <- range(x, finite = TRUE)
+    r + c(-1, 1) * diff(r) * fraction
+}
+
+# plotting helpers
+base_plot <- function(df, field) {
+    p <- ggplot(df, aes(pt_route1, pt_route2, colour = .data[[field]])) + geom_point_rast(alpha = 0.2, size = 0.5, 
+        raster.dpi = 300)
+    p + geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "gray67") + theme_bw() + labs(x = "Pseudotime Lineage 1", 
+        y = "Pseudotime Lineage 2")
+}
+
+```
+
+### Diffusion map with all seven metaprograms
+
+```{r diffusion_map_all_metaprograms}
+
+library(destiny)
+scores <- as.matrix(training$metadata[, training$features])
+set.seed(1234)
+dm_all <- DiffusionMap(scores)
+
+```
+
+### Proliferation relative to the other metaprograms
+
+```{r proliferation_diffusion_panel}
+
+withr::with_preserve_seed(local({
+  library(plot3D)
+
+  # seven-program centroids
+  training <- list(coordinates = eigenvectors(dm_all)[, 1:3, drop = FALSE], metadata = training$metadata, signs = rep(1, 3))
+  df <- as.data.frame(training$coordinates)
+  names(df) <- paste0('DC', 1:3)
+  df$metaprogram <- as.character(training$metadata$melanoma_mp)
+  centres <- df %>% group_by(metaprogram) %>% summarise(across(DC1:DC3, mean), .groups = 'drop')
+  points <- as.matrix(centres[, c('DC1', 'DC2', 'DC3')])
+  prolif <- centres$metaprogram == 'proliferation_cell_cycle'
+  fit <- prcomp(points[!prolif, ], center = TRUE, scale. = FALSE)
+  basis <- fit$rotation[, 1:2, drop = FALSE]
+  uv <- sweep(points[!prolif, ], 2, fit$center, '-') %*% basis
+
+  # reference plane
+  u <- pad_range(uv[, 1], 0.20)
+  v <- pad_range(uv[, 2], 0.20)
+  corners <- rbind(c(u[1], v[1]), c(u[2], v[1]), c(u[1], v[2]), c(u[2], v[2]))
+  plane <- t(apply(corners, 1, function(x) fit$center + x[1] * basis[, 1] + x[2] * basis[, 2]))
+  xlim <- pad_range(c(df$DC1, plane[, 1]), 0.04)
+  ylim <- pad_range(c(df$DC2, plane[, 2]), 0.04)
+  zlim <- pad_range(c(df$DC3, plane[, 3]), 0.04)
+
+  # proliferation panel
+  open_panel('S7B_proliferation_diffusion_plane')
+  surf3D(x = matrix(plane[, 1], 2, byrow = TRUE), y = matrix(plane[, 2], 2, byrow = TRUE), z = matrix(plane[, 3], 2, byrow = TRUE), colvar = NULL, col = adjustcolor('grey75', alpha.f = 0.25), border = 'grey55', colkey = FALSE, theta = 70, phi = 18, expand = 0.8, xlim = xlim, ylim = ylim, zlim = zlim, xlab = 'DC1', ylab = 'DC2', zlab = 'DC3', ticktype = 'detailed', bty = 'g')
+  for (mp in unique(df$metaprogram)) {
+      cells <- df[df$metaprogram == mp, ]
+      scatter3D(cells$DC1, cells$DC2, cells$DC3, colvar = NULL, col = adjustcolor(mp_pal[[mp]], alpha.f = 0.08), 
+          pch = 16, cex = 0.25, add = TRUE)
+  }
+  for (i in seq_len(nrow(centres))) {
+      mp <- centres$metaprogram[i]
+      segments3D(fit$center[1], fit$center[2], fit$center[3], centres$DC1[i], centres$DC2[i], centres$DC3[i], col = mp_pal[[mp]], 
+          lwd = ifelse(prolif[i], 4, 2), add = TRUE)
+  }
+  points3D(centres$DC1, centres$DC2, centres$DC3, colvar = NULL, pch = 21, cex = 1.6, col = 'black', bg = mp_pal[centres$metaprogram], add = TRUE)
+  points3D(fit$center[1], fit$center[2], fit$center[3], colvar = NULL, pch = 23, cex = 1.1, col = 'black', bg = 'black', add = TRUE)
+  text3D(centres$DC1 + 0.02 * diff(xlim), centres$DC2 + 0.01 * diff(ylim), centres$DC3 + 0.01 * diff(zlim), labels = diffusion_labels[centres$metaprogram], cex = 0.85, col = 'black', add = TRUE)
+  dev.off()
+}))
+
+```
+
+The proliferation/cell-cycle program separates from the other states in the seven-state map. We therefore exclude it when fitting the differentiation trajectories below.
+
+### Diffusion map without proliferation
+
+```{r melanoma_diffusion_map}
+
+library(destiny)
+
+# exclude proliferation cells and the proliferation score from trajectory fitting
+features_use <- setdiff(training$features, 'proliferation_cell_cycle')
+metadata <- training$metadata[training$metadata$melanoma_mp != 'proliferation_cell_cycle', ]
+scores <- as.matrix(metadata[, features_use])
+
+# diffusion map
+set.seed(1234)
+dm <- DiffusionMap(scores)
+
+# diffusion coordinates
+coordinates <- eigenvectors(dm)[, 1:3, drop = FALSE]
+signs <- rep(1, 3)
+
+```
+
+### Melanoma trajectories
+
+```{r melanoma_trajectories}
+
+library(slingshot)
+library(SingleCellExperiment)
+training <- list(coordinates = coordinates, signs = signs, metadata = metadata, features = features_use)
+
+# fit trajectories
+sce <- SingleCellExperiment(colData = S4Vectors::DataFrame(training$metadata))
+coordinates <- training$coordinates
+colnames(coordinates) <- paste0('DC', 1:3)
+reducedDims(sce)$DM <- coordinates
+sce <- slingshot(sce, clusterLabels = 'melanoma_mp', reducedDim = 'DM', allow.breaks = FALSE, shrink = TRUE, extend = 'y', reweight = TRUE, reassign = TRUE, thresh = 0.001, maxit = 15, stretch = 2, smoother = 'smooth.spline', shrink.method = 'cosine')
+fit <- SlingshotDataSet(sce)
+
+```
+
+### Fitted differentiation trajectories
+
+```{r fitted_diffusion_panel}
+
+withr::with_preserve_seed(local({
+  library(plot3D)
+
+  # fitted diffusion space
+  X <- training$coordinates
+  mp <- as.character(training$metadata$melanoma_mp)
+  df <- as.data.frame(X)
+  names(df) <- paste0('DC', 1:3)
+  df$metaprogram <- mp
+  centres <- df %>% group_by(metaprogram) %>% summarise(across(DC1:DC3, median), .groups = 'drop')
+  curves <- slingCurves(fit)
+
+  # trajectory panel
+  open_panel('S7C_fitted_diffusion_trajectories')
+  scatter3D(X[, 1], X[, 2], X[, 3], colvar = NULL, col = adjustcolor(mp_pal[mp], alpha.f = 0.18), pch = 16, cex = 0.35, theta = 135, phi = 25, xlab = 'DC1', ylab = 'DC2', zlab = 'DC3', ticktype = 'detailed', bty = 'g')
+  for (i in 1:2) {
+      curve <- curves[[i]]$s[, 1:3, drop = FALSE]
+      lines3D(curve[, 1], curve[, 2], curve[, 3], col = c("#E377C2", "#353C40")[i], lwd = 6, add = TRUE)
+  }
+  points3D(centres$DC1, centres$DC2, centres$DC3, colvar = NULL, pch = 21, cex = 1.8, col = 'black', bg = mp_pal[centres$metaprogram], add = TRUE)
+  text3D(centres$DC1, centres$DC2 + 0.005, centres$DC3, labels = diffusion_labels[centres$metaprogram], adj = 0, cex = 0.9, add = TRUE)
+  dev.off()
+}))
+
+```
+
+### Metaprogram distributions along the fitted lineages
+
+```{r training_trajectory_evidence}
+
+withr::with_preserve_seed(local({
+  library(slingshot)
+
+  # cell summaries
+  pt <- slingPseudotime(fit)
+  weights <- slingCurveWeights(fit, as.probs = FALSE)
+  cells <- data.frame(cell = rownames(pt), metaprogram = training$metadata$melanoma_mp, training$coordinates, pt1 = pt[, 1], pt2 = pt[, 2], weight1 = weights[, 1], weight2 = weights[, 2])
+  counts <- bind_rows(cells %>% filter(!is.na(pt1)) %>% dplyr::count(metaprogram) %>% mutate(lineage = 'Lineage 1'), cells %>% filter(!is.na(pt2)) %>% dplyr::count(metaprogram) %>% mutate(lineage = 'Lineage 2')) %>% mutate(include_density = n > 500)
+
+  # export training-cell and density summaries
+  write.csv(cells, file.path(result_dir, 'S7_training_trajectory_cells.csv'), row.names = FALSE)
+  write.csv(counts, file.path(result_dir, 'S7DE_density_program_counts.csv'), row.names = FALSE)
+  density_values <- bind_rows(data.frame(metaprogram = cells$metaprogram, pseudotime = pt[, 1], lineage = 'Lineage 1'),
+                              data.frame(metaprogram = cells$metaprogram, pseudotime = pt[, 2], lineage = 'Lineage 2')) %>%
+    filter(!is.na(pseudotime)) %>% group_by(lineage, metaprogram) %>% filter(n() > 500) %>% ungroup()
+  write.csv(density_values, file.path(result_dir, 'S7DE_density_inputs.csv'), row.names = FALSE)
+
+  # training densities
+  df <- density_values
+  for (i in 1:2) {
+      cells <- filter(df, lineage == paste("Lineage", i))
+      p <- ggplot(cells, aes(pseudotime, colour = metaprogram)) + geom_density() + theme_bw() +
+        scale_colour_manual(values = mp_pal) + labs(x = paste0("Pseudotime (lineage ", i, ")"), y = "Density") + 
+          theme(legend.position = "none")
+      save_panel(p, paste0(c("S7D", "S7E")[i], "_training_density"), 5, 3)
+  }
+}))
+
+```
+
+### Project melanoma cells onto the trajectories
+
+```{r project_melanoma_trajectories}
+
+# projection scores
+scores <- scale(as.matrix(mel[[]][, training$features]))
+scores[scores > 3] <- 3
+scores[scores < -3] <- -3
+cells <- rownames(scores)
+gc()
+
+# diffusion projection
+starts <- seq.int(1L, nrow(scores), by = 2000L)
+parts <- lapply(starts, function(start) {
+    index <- seq.int(start, min(start + 1999L, nrow(scores)))
+    destiny::dm_predict(dm, scores[index, , drop = FALSE])[, 1:3, drop = FALSE]
+})
+coordinates <- do.call(rbind, parts)
+coordinates <- sweep(coordinates, 2, training$signs, '*')
+rownames(coordinates) <- cells
+colnames(coordinates) <- paste0('DC', 1:3)
+
+# trajectory projection
+projected <- slingshot::predict(fit, newdata = coordinates)
+pt_na <- slingPseudotime(projected)
+pt <- slingPseudotime(projected, na = FALSE)
+weights <- slingCurveWeights(projected, as.probs = FALSE)
+assignment <- ifelse(is.na(pt_na[, 1]), 'Lineage 2', ifelse(is.na(pt_na[, 2]), 'Lineage 1', 'Shared Trunk'))
+result <- data.frame(cell_id = cells, DM1 = coordinates[, 1], DM2 = coordinates[, 2], DM3 = coordinates[, 3], pt_route1_raw = pt[, 1], pt_route2_raw = pt[, 2], w1 = weights[, 1], w2 = weights[, 2], slingshot_lineage_assignment = assignment)
+
+```
+
+### Projected lineage weights before alignment
+
+```{r raw_projection_panel}
+
+withr::with_preserve_seed(local({
+  df <- result %>% mutate(pt_route1 = pt_route1_raw, pt_route2 = pt_route2_raw,
+                         pt_merged = (pt_route1 + pt_route2) / 2, pt_class = 'Shared Trunk', weight = w1 + w2)
+  skeleton <- make_centerline(filter(df, weight >= 1.5), "Shared Trunk", "pt_merged", n_bins = 70, span = 0.25)
+  p <- base_plot(df, "weight") + geom_path(data = skeleton, aes(x = pt_route1_s, y = pt_route2_s), inherit.aes = FALSE, 
+      colour = "gray37", linewidth = 1, lineend = "round") +
+    scale_colour_gradient2(low = "indianred", mid = "white", high = "seagreen", midpoint = 1.5, name = "w1 + w2")
+  save_panel(p, 'S7F_projection_weights', 5, 4)
+}))
+
+```
+
+### Trajectory correction checkpoint
+
+```{r align_trajectory_branches}
+
+df <- result %>% mutate(pt_route1 = pt_route1_raw, pt_route2 = pt_route2_raw, pt_merged = (pt_route1 + pt_route2) / 2, delta = pt_route1 - pt_route2, pt_class = 'Shared Trunk')
+
+# trunk correction
+trunk <- make_centerline(df %>% filter(w1 + w2 >= 1.5), 'Shared Trunk', 'pt_merged', n_bins = 70, span = 0.25)
+projection <- nearest_on_skeleton(as.matrix(df[, c('pt_route1', 'pt_route2')]), as.matrix(trunk[, c('pt_route1_s', 'pt_route2_s')]))
+df$pt_route2 <- df$pt_route2_raw - (projection$pt2_line - projection$pt1_line)
+df <- df %>% mutate(pt_merged = (pt_route1 + pt_route2) / 2, delta = pt_route1 - pt_route2)
+
+```
+
+### Projected lineage weights after alignment
+
+```{r aligned_projection_panel}
+
+withr::with_preserve_seed(local({
+  df <- df %>% mutate(pt_class = 'Shared Trunk', weight = w1 + w2)
+  df$pt_merged <- (result$pt_route1_raw + result$pt_route2_raw) / 2
+  skeleton <- make_centerline(filter(df, weight >= 1.5), "Shared Trunk", "pt_merged", n_bins = 70, span = 0.25)
+  p <- base_plot(df, "weight") + geom_path(data = skeleton, aes(x = pt_route1_s, y = pt_route2_s), inherit.aes = FALSE, 
+      colour = "gray37", linewidth = 1, lineend = "round") +
+    scale_colour_gradient2(low = "indianred", mid = "white", high = "seagreen", midpoint = 1.5, name = "w1 + w2")
+  save_panel(p, 'S7G_aligned_weights', 5, 4)
+}))
+
+```
+
+### Locate the shared-trunk fork
+
+```{r infer_trajectory_fork}
+
+# locate the fork from pseudotime dispersion
+dispersion <- df %>% mutate(bin = ntile(pt_merged, 100)) %>% group_by(bin) %>% summarise(prog = median(pt_merged), mads = mad(delta), .groups = 'drop') %>% arrange(prog)
+fork <- dispersion$prog[which(dispersion$mads > 0.10 * max(dispersion$mads, na.rm = TRUE))[1]]
+
+```
+
+### Pseudotime dispersion and selected fork
+
+```{r trajectory_fork_panel}
+
+withr::with_preserve_seed(local({
+  # fork dispersion
+  df <- dispersion
+  df$mad_s <- predict(loess(mads ~ prog, data = df, span = 0.3, degree = 2))
+  p <- ggplot(df, aes(prog, mads)) + geom_point() + geom_line(aes(y = mad_s), colour = 'red') + theme_bw() +
+    geom_vline(xintercept = fork, linetype = 'dashed') + geom_hline(yintercept = 0, linetype = 'dashed') +
+    labs(x = 'Merged pseudotime', y = 'Dispersion (MAD)')
+  save_panel(p, 'S7I_fork_dispersion', 4, 3)
+}))
+
+```
+
+### Identify distant projections
+
+```{r identify_trajectory_outliers}
+
+df <- df %>% mutate(pt_class = ifelse(pt_merged < fork, 'Shared Trunk', ifelse(w2 < w1, 'Lineage 1', ifelse(w1 < w2, 'Lineage 2', 'Shared Trunk'))))
+skeleton <- bind_rows(make_centerline(df, 'Shared Trunk', 'pt_merged', n_bins = 70, span = 0.25), make_centerline(df, 'Lineage 1', 'pt_route1', n_bins = 90, span = 0.30), make_centerline(df, 'Lineage 2', 'pt_route2', n_bins = 90, span = 0.30))
+
+# outlier distances
+df$cl_dist <- NA_real_
+for (cl in unique(df$pt_class)) {
+    index <- which(df$pt_class == cl)
+    s <- skeleton %>% filter(pt_class == cl)
+    df$cl_dist[index] <- vapply(index, function(i) sqrt(min((s$pt_route1_s - df$pt_route1[i])^2 + (s$pt_route2_s - 
+        df$pt_route2[i])^2)), numeric(1))
+}
+threshold <- mean(df$cl_dist) + 3 * sd(df$cl_dist)
+df$cl_far <- df$cl_dist > threshold
+noise_sd <- median(df$cl_dist[!df$cl_far], na.rm = TRUE)
+
+```
+
+### Flagged projections
+
+```{r trajectory_outlier_panel}
+
+withr::with_preserve_seed(local({
+  # flagged cells
+  df <- df %>% mutate(flagged = factor(cl_far, levels = c(FALSE, TRUE), labels = c('No', 'Yes')))
+  p <- base_plot(df, 'flagged') + scale_colour_manual(values = c('No' = 'gray87', 'Yes' = 'indianred'), name = 'Flagged') +
+    guides(colour = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+    theme(legend.position = "bottom")
+  save_panel(p, 'S7H_flagged_cells')
+}))
+
+```
+
+### Apply trajectory corrections
+
+```{r apply_trajectory_corrections}
+
+correction <- list(metadata = df, skeleton = skeleton, dispersion = dispersion, fork = fork, threshold = threshold, noise_sd = noise_sd)
+
+path <- file.path(input_dir, 'trajectory_outlier_coordinates.csv')
+retained <- read.csv(path)
+before_outlier <- df[, c('pt_route1', 'pt_route2', 'pt_merged', 'delta', 'pt_class'), drop = FALSE]
+colnames(before_outlier) <- paste0(colnames(before_outlier), '_aligned')
+df <- correct_trajectory_outliers(correction, retained = retained)
+df <- cbind(df, before_outlier)
+
+```
+
+### Retain the corrected trajectory coordinates
+
+```{r retain_trajectory_metadata}
+
+index <- match(colnames(mel), df$cell_id)
+metadata <- df[index, setdiff(names(df), 'cell_id'), drop = FALSE]
+rownames(metadata) <- colnames(mel)
+mel <- AddMetaData(mel, metadata)
+
+```
+
+### Corrected trajectories and metaprograms
+
+```{r corrected_trajectory_panels}
+
+withr::with_preserve_seed(local({
+  final <- trajectory_cells(mel)
+
+  # final classes
+  p <- base_plot(final, 'pt_class') + scale_colour_manual(values = route_cols) + theme(legend.position = 'none')
+  save_panel(p, 'S7J_final_trajectory_classes')
+
+  # metaprogram projection
+  index <- match(final$cell_id, colnames(mel))
+  final$melanoma_mp <- as.character(mel$melanoma_mp[index])
+  skeleton <- bind_rows(make_centerline(final, 'Shared Trunk', 'pt_merged', n_bins = 70, span = 0.25), make_centerline(final, 'Lineage 1', 'pt_route1', n_bins = 90, span = 0.30), make_centerline(final, 'Lineage 2', 'pt_route2', n_bins = 90, span = 0.30))
+  centres <- final %>% group_by(melanoma_mp) %>% summarise(pt_route1 = median(pt_route1), pt_route2 = median(pt_route2), .groups = 'drop')
+  p <- base_plot(final, 'melanoma_mp') + geom_path(data = skeleton, aes(x = pt_route1_s, y = pt_route2_s, colour = pt_class), linewidth = 1, lineend = 'round') +
+    geom_point(data = centres, aes(colour = melanoma_mp), shape = 23, fill = 'white', size = 3) +
+    scale_colour_manual(values = c(mp_pal, route_cols)) + guides(colour = guide_legend(override.aes = list(alpha = 1, size = 3)))
+  save_panel(p, 'Figure_2F_metaprogram_trajectories', 6, 4)
+}))
+
+```
+
+### Metaprogram composition along the trajectories
+
+```{r metaprogram_trajectory_enrichment}
+
+withr::with_preserve_seed(local({
+  metadata <- trajectory_cells(mel)
+  index <- match(metadata$cell_id, colnames(mel))
+  metadata$melanoma_mp <- as.character(mel$melanoma_mp[index])
+  membership <- final %>% distinct(community, metaprogram)
+
+  # enrichment
+  counts <- table(metadata$melanoma_mp, metadata$pt_class)
+  test <- chisq.test(counts)
+  values <- as.data.frame(counts) %>% dplyr::rename(metaprogram = Var1, trajectory = Var2, cells = Freq) %>%
+    group_by(metaprogram) %>% mutate(program_cells = sum(cells), percentage_within_programme = 100 * cells / program_cells) %>% ungroup() %>%
+    group_by(trajectory) %>% mutate(trajectory_cells = sum(cells), percentage_within_trajectory_class = 100 * cells / trajectory_cells) %>% ungroup()
+  values$expected <- as.vector(test$expected)
+  values$log2_OE <- log2(values$cells / values$expected)
+  values$programme <- membership$community[match(values$metaprogram, membership$metaprogram)]
+  classes <- c('Shared Trunk' = 'Shared trunk', 'Lineage 1' = 'L1', 'Lineage 2' = 'L2')
+  values$trajectory_class <- unname(classes[as.character(values$trajectory)])
+
+  write.csv(values, file.path(result_dir, 'Figure_2G_metaprogram_trajectory_enrichment.csv'), row.names = FALSE)
+
+  df <- values
+  programs <- c('epithelial_adjacent', 'early_developmental_stress', 'proliferation_cell_cycle', 'differentiated_melanocytic', 'ifn_associated_stress', 'nevus_like_senescence', 'mesenchymal_invasive')
+  labels <- c('Epithelial-adjacent', 'Developmental', 'Proliferative', 'Melanocytic', 'IFN-associated', 'Nevus-like', 'Mesenchymal-invasive')
+  df$metaprogram <- factor(df$metaprogram, levels = rev(programs), labels = rev(labels))
+  df$trajectory <- factor(df$trajectory, levels = c('Shared Trunk', 'Lineage 1', 'Lineage 2'))
+
+  # enrichment panel
+  p <- ggplot(df, aes(trajectory, metaprogram, fill = log2_OE)) + geom_tile(colour = 'white', linewidth = 0.8) +
+    geom_text(aes(label = sprintf('%.1f%%\n[%.1f%%]', percentage_within_programme, percentage_within_trajectory_class), colour = abs(log2_OE) > 1.5), lineheight = 0.9, size = 3.2) +
+    scale_colour_manual(values = c('FALSE' = 'black', 'TRUE' = 'white'), guide = 'none') +
+    scale_fill_gradient2(low = 'steelblue4', mid = 'white', high = 'firebrick3', midpoint = 0, limits = c(-3, 3), oob = scales::squish, name = expression(log[2]('O/E'))) +
+    coord_fixed() + theme_classic() + labs(x = NULL, y = NULL, caption = 'Row %; [column %]') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.text.y = element_text(size = 10), plot.caption = element_text(hjust = 0))
+  path <- file.path(result_dir, 'Figure_2G_metaprogram_trajectory_enrichment.pdf')
+  ggsave(path, p, width = 5, height = 5, useDingbats = FALSE)
+}))
+
+```
+
+### Summary of the shared trunk and two branches
+
+```{r trajectory_schematic}
+
+withr::with_preserve_seed(local({
+  # schematic
+  nodes <- data.frame(x = c(40, 102, 164, 223, 289, 289), y = c(0, 0, 0, 17, 17, -17), label = c('Epithelial-adj.', 'Developmental', 'Melanocytic', 'IFN', 'MES', 'Nevus-like'), colour = c('#009E73', '#DAA520', '#A52A2A', '#FF7F50', '#FFC0CB', '#D55E00'))
+  edges <- data.frame(x = c(40, 190, 190, 213, 213), y = c(0, 0, 0, 17, -17), xend = c(190, 213, 213, 289, 289), yend = c(0, 17, -17, 17, -17))
+  headers <- data.frame(x = c(102, 253, 253), y = c(14, 29, -5), label = c('Shared trunk', 'Lineage 1', 'Lineage 2'))
+  p <- ggplot() + geom_segment(data = edges, aes(x, y, xend = xend, yend = yend), colour = '#9CA6B2', linewidth = 0.4) +
+    geom_point(data = nodes, aes(x, y, colour = colour), size = 2.5) + scale_colour_identity() +
+    geom_text(data = nodes, aes(x, y - 10, label = label), size = 2.5) +
+    geom_text(data = headers, aes(x, y, label = label), size = 2.7, fontface = 'bold', colour = '#667085') +
+    coord_cartesian(xlim = c(0, 320), ylim = c(-36, 36), clip = 'off') + theme_void()
+  path <- file.path(result_dir, 'Figure_2H_trajectory_schematic.pdf')
+  ggsave(path, p, width = 5, height = 1.5, useDingbats = FALSE)
+}))
+
+```
+
+## Save the results
+
+```{r save_results}
+
+mel@misc$trajectory_training <- trajectory_training
+mel@misc$trajectory_models <- list(diffusion_map_all = dm_all, diffusion_map = dm, slingshot = fit, signs = signs)
+mel@misc$trajectory_correction <- list(skeleton = skeleton, dispersion = dispersion, fork = fork,
+                                      threshold = threshold, noise_sd = noise_sd)
+mel@misc$metaprogram_graphs <- list(kappa = kappa, graph = graph, stress_graph = stress_graph)
+mel@misc$metaprogram_gene_sets <- setNames(module_sets, unname(mp_names))
+saveRDS(mel, file.path(intermediate_dir, 'melanoma_analysis.rds'))
+
+```

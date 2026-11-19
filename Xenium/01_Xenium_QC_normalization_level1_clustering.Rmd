@@ -1,0 +1,456 @@
+---
+title: "Xenium QC, normalization and Level 1 clustering"
+author: "Asier Antoranz"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+---
+
+Imports Xenium counts, filters and normalises cells, and assigns broad cellular lineages, including separation of melanoma and nerve-associated cells.
+
+**Inputs:** Count matrices, cell coordinates and boundaries from `paper_data/Xenium/raw`, with sample metadata and annotation dictionaries from `paper_data/Xenium/inputs`.
+
+**Outputs:** Filtered counts, normalised and annotated objects in `data/`; QC tables, marker results and QC/nerve-resolution plots in `results/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+code_root <- 'path_to_code'
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                    cache = FALSE, cache.lazy = FALSE, fig.align = 'center')
+knitr::opts_knit$set(root.dir = code_root)
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(RColorBrewer)
+library(Seurat)
+library(Matrix)
+library(data.table)
+library(ggplot2)
+library(ggrastr)
+library(ggrepel)
+
+outdir <- file.path(output_root, 'Xenium')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+data_dir <- file.path(data_root, 'Xenium')
+input_dir <- file.path(data_dir, 'inputs')
+raw_dir <- file.path(data_dir, 'raw')
+for (path in c(outdir, intermediate_dir, result_dir)) {
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+}
+options(Seurat.object.assay.version = 'v5', future.globals.maxSize = 50 * 1024^3)
+future::plan('sequential')
+source(file.path(code_root, 'Xenium', 'helpers.R'), local = TRUE)
+
+```
+
+## Import and quality control
+
+### Xenium import and QC
+
+```{r xenium_import_and_qc}
+
+# acquisitions
+samples <- read.csv(file.path(input_dir, 'samples.csv'))
+files <- file.path(raw_dir, samples$sample_id, 'cell_feature_matrix.h5')
+
+# read counts
+counts <- vector('list', length(files))
+metadata <- vector('list', length(files))
+for (i in seq_along(files)) {
+    print(paste0("Reading acquisition ", i, "/", length(files)))
+    counts[[i]] <- Read10X_h5(files[i])[["Gene Expression"]]
+    colnames(counts[[i]]) <- paste(samples$sample_id[i], colnames(counts[[i]]), sep = "_")
+    metadata[[i]] <- data.frame(cell = colnames(counts[[i]]), sample_id = samples$sample_id[i], patient = samples$patient[i], 
+        nCount_Xenium = Matrix::colSums(counts[[i]]), nFeature_Xenium = Matrix::colSums(counts[[i]] > 0))
+}
+counts <- do.call(cbind, counts)
+metadata <- bind_rows(metadata)
+raw_qc <- metadata %>% select(cell_id = cell, sample_id, nCount_Xenium, nFeature_Xenium)
+
+# cell selection
+metadata$keep <- metadata$nCount_Xenium >= 10
+qc <- metadata %>% 
+  group_by(sample_id, patient) %>% 
+  summarise(raw_cells = n(), retained_cells = sum(keep), removed_cells = sum(!keep), .groups = 'drop')
+
+write.csv(qc, file.path(result_dir, 'acquisition_qc.csv'), row.names = FALSE)
+scale_factor <- median(metadata$nCount_Xenium[metadata$keep])
+
+# save QC-filtered counts and metadata
+input <- list(counts = counts[, metadata$keep], metadata = metadata[metadata$keep, ], samples = samples, scale_factor = scale_factor)
+saveRDS(input, file.path(intermediate_dir, 'counts_qc.rds'))
+rm(counts)
+
+```
+
+### Xenium normalization
+
+```{r xenium_normalization}
+
+# load cell boundaries
+files <- file.path(raw_dir, samples$sample_id, 'cell_boundaries.csv.gz')
+
+# polygon areas: size of each cell 
+areas <- vector('list', length(files))
+for (i in seq_along(files)) {
+    print(paste0("Reading cell boundaries ", i, "/", length(files)))
+    boundaries <- fread(files[i], select = c("cell_id", "vertex_x", "vertex_y"))
+    boundaries[, `:=`(cell, paste(input$samples$sample_id[i], cell_id, sep = "_"))]
+    boundaries <- boundaries[cell %in% input$metadata$cell]
+    areas[[i]] <- boundaries[, .(cell_area = sp::Polygon(cbind(vertex_x, vertex_y))@area), by = cell]
+}
+areas <- rbindlist(areas)
+
+# prepare object
+metadata <- input$metadata
+metadata$cell_area <- areas$cell_area[match(metadata$cell, areas$cell)]
+metadata$log_nCount <- log1p(metadata$nCount_Xenium)
+metadata$log_area <- log1p(metadata$cell_area)
+rownames(metadata) <- metadata$cell
+seurat_object <- CreateSeuratObject(counts = input$counts, assay = 'Xenium', meta.data = metadata)
+rm(input, boundaries, areas)
+gc()
+
+# normalize and scale
+seurat_object <- NormalizeData(seurat_object, assay = 'Xenium', normalization.method = 'LogNormalize', scale.factor = scale_factor)
+seurat_object <- ScaleData(seurat_object, assay = 'Xenium', vars.to.regress = c('log_nCount', 'log_area'), features = VariableFeatures(seurat_object))
+
+```
+
+### Xenium count threshold
+
+```{r xenium_count_threshold}
+
+# raw plotting inputs
+metadata <- raw_qc
+
+# histogram
+path <- file.path(result_dir, 'Supplementary_Figure_2B_count_threshold.pdf')
+pdf(path, width = 5, height = 5, useDingbats = FALSE)
+h <- hist(asinh(metadata$nCount_Xenium), breaks = 128, main = 'Distribution of asinh(nCount_Xenium)', xlab = 'asinh(nCount_Xenium)')
+abline(v = asinh(10), col = 'red', lty = 2, lwd = 2)
+dev.off()
+write.csv(data.frame(lower = head(h$breaks, -1), upper = tail(h$breaks, -1), cells = h$counts), file.path(result_dir, 'Supplementary_Figure_2B_histogram_bins.csv'), row.names = FALSE)
+
+```
+
+### Xenium spatial QC
+
+```{r xenium_spatial_qc}
+
+# example acquisition
+sample_use <- 'thinmme006_2' # change if another sample needs viewing
+path <- file.path(raw_dir, sample_use, 'cells.csv.gz')
+cells <- fread(path, select = c('cell_id', 'x_centroid', 'y_centroid'))
+cells[, cell_id := paste(sample_use, cell_id, sep = '_')]
+df <- metadata[metadata$sample_id == sample_use, ]
+index <- match(df$cell_id, cells$cell_id)
+df$x <- cells$x_centroid[index]
+df$y <- cells$y_centroid[index]
+
+# patient label and orientation
+patient <- samples$patient[match(sample_use, samples$sample_id)]
+if (max(df$y) > max(df$x)) df[c('x', 'y')] <- df[c('y', 'x')]
+spatial_qc <- df
+plot_width <- max(df$x) / 1000 + 2
+plot_height <- max(df$y) / 1000
+qc_theme <- theme_void(base_size = 8) + theme(plot.title = element_text(size = 10, hjust = 0.5), legend.position = 'right', legend.text = element_text(size = 10), legend.title = element_text(size = 10))
+
+# transcript counts
+p <- ggplot(df, aes(x = x, y = y, colour = asinh(nCount_Xenium))) + ggrastr::geom_point_rast(size = 0.5, alpha = 0.9, raster.dpi = 300) + coord_equal(expand = FALSE) + labs(title = paste0(patient, ', acquisition 2')) + qc_theme + viridis::scale_color_viridis()
+path <- file.path(result_dir, 'Supplementary_Figure_2A_spatial_counts.pdf')
+ggsave(path, p, width = plot_width, height = plot_height, dpi = 300, bg = 'white')
+
+# QC threshold
+p <- ggplot(df, aes(x = x, y = y, colour = nCount_Xenium >= 10)) + ggrastr::geom_point_rast(size = 0.5, alpha = 0.9, raster.dpi = 300) + coord_equal(expand = FALSE) + labs(title = paste0(patient, ', acquisition 2')) + qc_theme +
+  scale_colour_manual(values = c('TRUE' = 'grey80', 'FALSE' = 'firebrick'), labels = c('FALSE' = '< 10 counts', 'TRUE' = '≥ 10 counts'))
+path <- file.path(result_dir, 'Supplementary_Figure_2C_spatial_threshold.pdf')
+ggsave(path, p, width = plot_width, height = plot_height, dpi = 300, bg = 'white')
+
+```
+
+### Xenium transcript counts and cell area
+
+```{r xenium_transcript_counts_and_cell_area}
+
+# plotting input
+df <- seurat_object[[]][, c('nCount_Xenium', 'cell_area')]
+
+# count-area relationship
+fit <- cor.test(df$nCount_Xenium, df$cell_area, method = 'pearson')
+write.csv(data.frame(cells = nrow(df), pearson_r = unname(fit$estimate), p_value = fit$p.value), file.path(result_dir, 'Supplementary_Figure_2D_count_area_correlation.csv'), row.names = FALSE)
+p <- ggplot(df, aes(x = nCount_Xenium, y = cell_area)) + geom_hex(aes(fill = after_stat(asinh(count)))) +
+  geom_smooth(method = 'lm', se = FALSE, colour = 'black', linetype = 'dashed', linewidth = 0.8) + theme_bw() +
+  viridis::scale_fill_viridis(name = 'asinh(cell count per bin)') + labs(x = 'nCount_Xenium', y = 'Cell area') +
+  ggpubr::stat_cor(method = 'pearson', geom = 'label', label.x.npc = 0.04, label.y.npc = 0.96, size = 4, color = 'black', fill = 'white', label.size = 0.25, fontface = 'bold') + theme(legend.position = 'bottom')
+path <- file.path(result_dir, 'Supplementary_Figure_2D_count_area.pdf')
+ggsave(path, p, width = 5, height = 5, dpi = 300, bg = 'white')
+
+```
+
+## First-level clustering
+
+### Xenium clustering subset
+
+```{r xenium_clustering_subset}
+
+# cell dictionary
+dictionary <- read.csv(file.path(input_dir, 'clustering_cells.csv'))
+cells_use <- dictionary$cell_id
+obj_sub <- seurat_object[, cells_use]
+
+```
+
+### Xenium first-level clustering
+
+```{r xenium_first_level_clustering}
+
+# PCA
+obj_sub <- RunPCA(obj_sub, assay = 'Xenium', features = rownames(obj_sub), npcs = 30, seed.use = 42, verbose = FALSE)
+
+# clustering
+obj_sub <- FindNeighbors(obj_sub, dims = 1:20, k.param = 20, nn.method = 'annoy', n.trees = 50, verbose = FALSE)
+obj_sub <- FindClusters(obj_sub, resolution = 1, algorithm = 1, random.seed = 0, n.start = 10, n.iter = 10, verbose = FALSE)
+
+```
+
+### Xenium first-level markers
+
+```{r xenium_first_level_markers}
+
+obj_sub[['Xenium']] <- JoinLayers(obj_sub[['Xenium']])
+Idents(obj_sub) <- 'seurat_clusters'
+
+# find markers
+markers <- FindAllMarkers(obj_sub, assay = 'Xenium', layer = 'data', only.pos = TRUE, logfc.threshold = 0.25, min.pct = 0.25, test.use = 'wilcox', random.seed = 1)
+path <- file.path(result_dir, 'first_level_cluster_markers.csv')
+write.csv(markers, path, row.names = FALSE)
+
+```
+
+### Xenium subset QC
+
+```{r xenium_subset_qc}
+
+# silhouettes
+pca <- Embeddings(obj_sub, 'pca')[, 1:20]
+sil_sample <- bluster::approxSilhouette(pca, as.factor(obj_sub$sample_id))
+sil_cluster <- bluster::approxSilhouette(pca, as.factor(obj_sub$seurat_clusters))
+sil_compare <- bind_rows(data.frame(group = 'Sample identity', width = sil_sample$width), data.frame(group = 'Cluster identity', width = sil_cluster$width))
+write.csv(sil_compare, file.path(result_dir, 'Supplementary_Figure_2G_silhouette_widths.csv'), row.names = FALSE)
+
+coordinates <- read.csv(file.path(input_dir, 'clustering_subset_umap.csv'))
+embedding <- as.matrix(coordinates[, c('umap_1', 'umap_2')])
+rownames(embedding) <- coordinates$cell_id
+obj_sub[['umap']] <- CreateDimReducObject(embeddings = embedding, key = 'umap_', assay = 'Xenium')
+
+# acquisition labels
+obj_sub$plot_label <- obj_sub$sample_id
+
+# cluster UMAP
+cluster_levels <- sort(unique(as.character(obj_sub$seurat_clusters)))
+cluster_cols <- setNames(scales::hue_pal()(length(cluster_levels)), cluster_levels)
+set.seed(1234)
+p <- DimPlot(obj_sub, reduction = 'umap', group.by = 'seurat_clusters', label = TRUE, repel = TRUE, raster = TRUE, raster.dpi = c(300, 300), seed = 42) + theme(legend.position = 'none') + labs(title = NULL) + scale_color_manual(values = cluster_cols)
+path <- file.path(result_dir, 'Supplementary_Figure_2E_cluster_umap.pdf')
+ggsave(path, p, width = 5, height = 5, dpi = 300, bg = 'white')
+
+# silhouette panel
+means <- sil_compare %>% group_by(group) %>% summarise(mean_width = mean(width), .groups = 'drop')
+p <- ggplot(sil_compare, aes(x = group, y = width, fill = group)) + geom_violin(color = 'grey30', linewidth = 0.4, alpha = 0.85, trim = TRUE) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = 'white', color = 'grey20', linewidth = 0.4) +
+  geom_point(data = means, aes(x = group, y = mean_width), inherit.aes = FALSE, shape = 23, size = 2.6, fill = 'white', color = 'black', stroke = 0.7) +
+  geom_hline(yintercept = 0, linetype = 'dashed', color = 'grey40', linewidth = 0.4) + scale_fill_manual(values = c('Sample identity' = '#8C9AAE', 'Cluster identity' = '#3C7A89'), guide = 'none') +
+  ggpubr::stat_compare_means(comparisons = list(c('Sample identity', 'Cluster identity')), method = 'wilcox.test', label = 'p.format', tip.length = 0.01, bracket.size = 0.4, size = 4) +
+  labs(x = NULL, y = 'Silhouette width') + theme_classic(base_size = 13) + theme(axis.text = element_text(color = "black"), axis.title.y = element_text(margin = margin(r = 8)))
+path <- file.path(result_dir, 'Supplementary_Figure_2G_silhouette.pdf')
+ggsave(path, p, width = 4, height = 4.2, dpi = 300, bg = 'white')
+
+```
+
+### Xenium acquisition UMAP
+
+```{r xenium_acquisition_umap}
+
+df <- data.frame(embedding, plot_label = obj_sub$plot_label)
+labels <- df %>% group_by(plot_label) %>% summarise(umap_1 = median(umap_1), umap_2 = median(umap_2), .groups = 'drop')
+
+# acquisition panel
+p <- DimPlot(obj_sub, reduction = 'umap', group.by = 'plot_label', label = FALSE, raster = TRUE, raster.dpi = c(300, 300), seed = 42) +
+  ggrepel::geom_text_repel(data = labels, aes(x = umap_1, y = umap_2, label = plot_label), inherit.aes = FALSE, size = 2.3, 
+    max.overlaps = Inf, seed = 123) +
+  theme_classic() + theme(legend.position = 'none') + labs(title = NULL)
+path <- file.path(result_dir, 'Supplementary_Figure_2F_acquisition_umap.pdf')
+ggsave(path, p, width = 5, height = 5, dpi = 300, bg = 'white')
+
+```
+
+### Xenium full-cell clusters with indexed anchor lookup
+
+```{r xenium_cluster_transfer}
+
+seurat_object[['Xenium']] <- JoinLayers(seurat_object[['Xenium']])
+features_use <- rownames(seurat_object)
+
+# transfer clusters
+anchors <- FindTransferAnchors(reference = obj_sub, query = seurat_object, features = features_use, reduction = 'pcaproject', dims = 1:20)
+predictions <- TransferData(anchorset = anchors, refdata = obj_sub$seurat_clusters, dims = 1:20)
+seurat_object$seurat_clusters <- predictions$predicted.id
+seurat_object$seurat_clusters_score <- predictions$prediction.score.max
+rm(anchors)
+gc()
+
+```
+
+### Xenium spatial clusters
+
+```{r xenium_spatial_clusters}
+
+# plotting input
+df <- spatial_qc
+df <- df[df$nCount_Xenium >= 10, ]
+index <- match(df$cell_id, rownames(predictions))
+cluster_levels <- sort(unique(as.character(predictions$predicted.id)))
+cluster_cols <- setNames(scales::hue_pal()(length(cluster_levels)), cluster_levels)
+cluster_levels <- as.character(sort(as.integer(cluster_levels)))
+cluster_cols <- cluster_cols[cluster_levels]
+df$seurat_clusters <- factor(predictions$predicted.id[index], levels = cluster_levels)
+df$x <- df$x - min(df$x) + 1
+df$y <- df$y - min(df$y) + 1
+if (max(df$y) > max(df$x)) df[c('x', 'y')] <- df[c('y', 'x')]
+
+# spatial panel
+p <- ggplot(df, aes(x = x, y = y, colour = seurat_clusters)) + ggrastr::geom_point_rast(size = 0.01, alpha = 0.85, raster.dpi = 300) +
+  scale_colour_manual(values = cluster_cols, drop = FALSE) + coord_equal(expand = FALSE) + labs(title = 'thinmme006, acquisition 2') + theme_void(base_size = 8) +
+  theme(plot.title = element_text(size = 12, hjust = 0.5), legend.title = element_text(size = 12), legend.position = "right", 
+    legend.text = element_text(size = 10)) +
+  guides(colour = guide_legend(ncol = 1, override.aes = list(size = 3, alpha = 1)))
+path <- file.path(result_dir, 'Supplementary_Figure_2H_spatial_clusters.pdf')
+ggsave(path, p, width = max(df$x) / 750 + 1, height = max(df$y) / 750, dpi = 300, bg = 'white')
+
+```
+
+## Separate nerves and annotate the broad lineages
+
+### Xenium first-level annotation
+
+```{r xenium_first_level_annotation}
+
+# cluster 16
+cells16 <- colnames(seurat_object)[seurat_object$seurat_clusters == '16']
+sub <- subset(seurat_object, cells = cells16)
+pct16 <- Matrix::rowMeans(LayerData(sub, assay = 'Xenium', layer = 'counts') > 0)
+features_use <- names(pct16)[pct16 >= 0.05]
+sub <- ScaleData(sub, features = features_use, verbose = FALSE)
+sub <- RunPCA(sub, features = features_use, npcs = 30, reduction.name = 'pca16', seed.use = 42, verbose = FALSE)
+
+# cluster 16 embedding and clusters
+sub <- RunUMAP(sub, reduction = 'pca16', dims = 1:20, reduction.name = 'umap16', seed.use = 42, verbose = FALSE)
+sub <- FindNeighbors(sub, reduction = 'pca16', dims = 1:20, graph.name = 'snn16', verbose = FALSE)
+sub <- FindClusters(sub, graph.name = 'snn16', resolution = 0.6, algorithm = 1, random.seed = 0, verbose = FALSE)
+
+# melanoma and neural scores
+mel_module <- c('PMEL', 'TYR', 'S100A13', 'MLANA', 'MITF', 'TYRP1', 'PCDH7', 'QPCT', 'EDNRB', 'MYC')
+neu_module <- c('CRYAB', 'IGFBP5', 'NR2F2', 'TMEM176A', 'ITGA6', 'PLP1', 'DST', 'PTGDS', 'CXCL12', 'MYL9')
+sub <- AddModuleScore(sub, features = list(intersect(mel_module, rownames(sub))), name = 'mel_score', nbin = 12, ctrl = 20, assay = 'Xenium', seed = 1)
+sub <- AddModuleScore(sub, features = list(intersect(neu_module, rownames(sub))), name = 'neu_score', nbin = 12, ctrl = 20, assay = 'Xenium', seed = 1)
+mel_by_sub <- tapply(sub$mel_score1, sub$seurat_clusters, mean)
+nerve_sub <- names(which.min(mel_by_sub))
+nerve_cells <- colnames(sub)[sub$seurat_clusters == nerve_sub]
+saveRDS(sub, file.path(intermediate_dir, 'cluster16.rds'))
+
+```
+
+### Melanoma and nerve-cell evidence
+
+```{r nerve_resolution_evidence}
+
+withr::with_preserve_seed(local({
+  DefaultAssay(sub) <- 'Xenium'
+  Idents(sub) <- 'seurat_clusters'
+
+  # markers
+  markers <- FindAllMarkers(sub, assay = 'Xenium', layer = 'data', only.pos = TRUE, logfc.threshold = 0.25, min.pct = 0.25, test.use = 'wilcox', random.seed = 1)
+  selected <- markers %>% group_by(cluster) %>% slice_max(avg_log2FC, n = 5) %>% ungroup()
+  features <- unique(as.character(selected$gene))
+  write.csv(selected, file.path(result_dir, 'S3D_selected_markers.csv'), row.names = FALSE)
+
+  # dotplot inputs
+  dot_plot <- DotPlot(sub, features = features, assay = 'Xenium', dot.scale = 6)
+  dot_data <- dot_plot$data
+  write.csv(dot_data, file.path(result_dir, 'S3D_marker_expression.csv'), row.names = FALSE)
+
+  # melanoma and neural scores
+  scores <- data.frame(cell_id = colnames(sub), cluster = as.character(sub$seurat_clusters), mel_score = sub$mel_score1, neu_score = sub$neu_score1)
+  scores$mel_score_z <- pmin(as.numeric(scale(scores$mel_score)), 3)
+  scores$neu_score_z <- pmin(as.numeric(scale(scores$neu_score)), 3)
+  centroids <- scores %>% group_by(cluster) %>% summarise(mel_score = median(mel_score), neu_score = median(neu_score), .groups = 'drop')
+  write.csv(scores, file.path(result_dir, 'S3BC_module_scores.csv'), row.names = FALSE)
+  write.csv(centroids, file.path(result_dir, 'S3B_cluster_centroids.csv'), row.names = FALSE)
+
+  sub$mel_score_z <- scores$mel_score_z
+  sub$neu_score_z <- scores$neu_score_z
+
+  # embedding
+  p <- DimPlot(sub, reduction = 'umap16', group.by = 'seurat_clusters', label = TRUE, raster = TRUE, raster.dpi = c(300, 300))
+  save_panel(p, 'S3A_nerve_subclusters', 5, 4)
+
+  # score scatter
+  scores$cluster <- factor(scores$cluster, levels = 0:7)
+  centroids$cluster <- factor(centroids$cluster, levels = 0:7)
+  p <- ggplot(scores, aes(mel_score, neu_score, colour = cluster)) + geom_point_rast(size = 0.4, alpha = 0.8, raster.dpi = 300) +
+    theme_bw() + geom_label_repel(data = centroids, aes(label = cluster), seed = 1234) + theme(legend.position = 'none')
+  save_panel(p, 'S3B_nerve_module_scores', 4, 4)
+
+  # scores on embedding
+  p <- FeaturePlot(sub, features = c('mel_score_z', 'neu_score_z'), reduction = 'umap16', order = TRUE, pt.size = 0.4, ncol = 2, keep.scale = 'all', raster = TRUE, raster.dpi = c(300, 300))
+  p <- p & scale_color_gradient2(low = 'dodgerblue', mid = 'gray87', high = 'indianred', midpoint = 0)
+  save_panel(p, 'S3C_nerve_score_embeddings', 10, 4)
+
+  # marker expression
+  p <- dot_plot + RotatedAxis() +
+    scale_color_gradient2(low = 'steelblue', mid = 'white', high = 'indianred', midpoint = 0) + xlab(NULL) + ylab(NULL)
+  save_panel(p, 'S3D_nerve_marker_expression', 10, 4)
+}))
+
+```
+
+### Assign the broad lineages
+
+```{r assign_broad_lineages}
+
+# split nerves
+seurat_object$c16_class <- ifelse(colnames(seurat_object) %in% cells16, 'Melanoma', NA_character_)
+seurat_object$c16_class[colnames(seurat_object) %in% nerve_cells] <- 'Nerve'
+seurat_object$seurat_clusters_split <- as.character(seurat_object$seurat_clusters)
+seurat_object$seurat_clusters_split[colnames(seurat_object) %in% nerve_cells] <- '29'
+seurat_object$seurat_clusters_split <- factor(seurat_object$seurat_clusters_split, levels = as.character(0:29))
+
+# lineage labels
+dictionary <- read.csv(file.path(input_dir, 'first_level_lineage_dictionary.csv'))
+lookup <- setNames(dictionary$main_lineage, as.character(dictionary$cluster))
+seurat_object$main_lineage <- factor(unname(lookup[as.character(seurat_object$seurat_clusters_split)]), levels = c('Melanoma', 'Epithelial', 'Fibroblast', 'Stroma', 'Endothelial', 'Myeloid', 'Lymphocyte', 'Mast', 'Nerves'))
+
+# patient metadata
+patients <- read.csv(file.path(input_dir, 'patients.csv'))
+index <- match(seurat_object$patient, patients$patient)
+seurat_object$patient_id <- patients$patient[index]
+seurat_object$outcome <- patients$outcome[index]
+seurat_object$met <- ifelse(seurat_object$outcome == 'M+', 'met', 'nmet')
+seurat_object$pair <- sub('^MV', 'p', patients$pair[index])
+seurat_object@misc$level1_reference <- list(
+  pca = obj_sub[['pca']],
+  umap = obj_sub[['umap']],
+  metadata = obj_sub[[]][, c('sample_id', 'seurat_clusters'), drop = FALSE]
+)
+saveRDS(seurat_object, file.path(intermediate_dir, 'annotated.rds'))
+
+```
+
