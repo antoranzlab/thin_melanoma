@@ -7,7 +7,7 @@ This project examines how melanoma-cell states and their tissue environments rel
 - **Xenium:** targeted single-cell spatial RNA measurements.
 - **MILAN:** multiplex immunofluorescence protein measurements, matched to Xenium cells from the same section.
 - **Visium CytAssist:** broader spatial gene-expression profiles from corresponding sections.
-- **H&E:** image-inferred expression for independent histological validation; this workflow is not yet included here.
+- **H&E:** image-inferred expression for independent histological validation.
 - **Bulk transcriptomics:** external primary-melanoma cohorts for survival analyses.
 
 ## Repository structure
@@ -28,10 +28,13 @@ Notebooks are grouped by modality and numbered in execution order. Each contains
 | [Visium/02](Visium/02_Visium_gene_pathway_analysis.Rmd) | Compare genes and Hallmark pathways and model pseudotime trends. |
 | [Visium/04](Visium/04_Visium_registration_validation.Rmd) | Evaluate registered Xenium pseudospots, imputation and melanoma-spot selection. |
 | [Public_cohorts/01](Public_cohorts/01_Public_cohorts_survival.Rmd) | Test nevus-like scores against survival in Leeds and GSE98394. |
+| [virtualHE/01](virtualHE/01_generate_predictions.ipynb) | Predict expression from H&E and select melanoma-enriched spots. |
+| [virtualHE/02](virtualHE/02_prepare_expression.ipynb) | Combine predicted expression for metaprogram scoring. |
+| [virtualHE/03](virtualHE/03_metaprogrammes_figures.Rmd) | Calculate metaprogram fractions, outcome associations and validation figures. |
 | [Registration/01](Registration/01_Registration_coordinates.Rmd) | Summarize prepared registered coordinates; does not perform image registration. |
 | [Xenium/helpers.R](Xenium/helpers.R), [Visium/helpers.R](Visium/helpers.R) | Functions shared between notebooks. |
 
-Run Xenium 01–06 first, then MILAN 01–02 and Visium 01, 02 and 04. Visium 03 was incorporated into 01–02. Public-cohort analyses use the prepared Xenium signatures.
+Run Xenium 01–06 first, then MILAN 01–02 and Visium 01, 02 and 04. Visium 03 was incorporated into 01–02. Public-cohort analyses use the prepared Xenium signatures. Run virtual H&E notebooks 01–03 in order; their paths are set in `virtualHE/config.json`.
 
 ## Running the code
 
