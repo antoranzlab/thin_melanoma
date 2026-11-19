@@ -47,3 +47,7 @@ Syntax and selected small-data tests have passed; full execution of the revised 
 Set `workspace` and `output` in `virtualHE/config.json` to the input and output roots used by the other notebooks. The workflow builds its paths under `virtualHE/` automatically. Model, decoder and manifest paths are relative to that input folder. Run the Python notebooks from the code folder in order, followed by Rmd03.
 
 Gene definitions and metaprogram controls are included in `virtualHE/inputs/`. Slide metadata, H&E images, image tokens, predictions and model weights are supplied separately; patient metadata belong in the data root at `virtualHE/inputs/`. Configure the six decoder filenames to match the supplied files.
+
+## License
+
+Original project code is licensed under the [MIT License](LICENSE). Third-party packages, models and data retain their own terms; see [Third-party software](THIRD_PARTY_NOTICES.md), including the separate noncommercial restrictions for DeepSpot-M.
