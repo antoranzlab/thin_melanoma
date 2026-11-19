@@ -41,3 +41,9 @@ Run Xenium 01–06 first, then MILAN 01–02 and Visium 01, 02 and 04. Visium 03
 Data are supplied separately. Set `data_root <- 'path_to_input'`, `output_root <- 'path_to_output'` and, where present, `code_root <- 'path_to_code'` in each notebook's setup chunk. All remaining paths are built automatically. Install the R packages loaded in the notebooks; Visium imputation also uses Python through reticulate.
 
 Syntax and selected small-data tests have passed; full execution of the revised pipeline on the study data remains pending.
+
+## Virtual H&E configuration
+
+Set `workspace` and `output` in `virtualHE/config.json` to the input and output roots used by the other notebooks. The workflow builds its paths under `virtualHE/` automatically. Model, decoder and manifest paths are relative to that input folder. Run the Python notebooks from the code folder in order, followed by Rmd03.
+
+Gene definitions and metaprogram controls are included in `virtualHE/inputs/`. Slide metadata, H&E images, image tokens, predictions and model weights are supplied separately; patient metadata belong in the data root at `virtualHE/inputs/`. Configure the six decoder filenames to match the supplied files.
