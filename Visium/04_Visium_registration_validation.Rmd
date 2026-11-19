@@ -1,0 +1,405 @@
+---
+title: "Visium registration validation"
+author: "Asier Antoranz"
+output:
+  html_document:
+    df_print: paged
+---
+
+Aggregates registered Xenium cells into Visium pseudospots, evaluates the melanoma-weight threshold and imputation agreement, and summarises integration quality and regional composition.
+
+**Inputs:** Visium objects and tables from notebooks 01–02, Xenium counts and final annotations from notebooks 01 and 04, registered coordinates in `paper_data/Registration/Visium`, and raw Visium spatial data.
+
+**Outputs:** Registered pseudospots and their expression in `data/`; threshold, agreement and composition tables in `results/`; diagnostic and spatial panels in `figures/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+code_root <- 'path_to_code'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(data.table)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+
+outdir <- file.path(output_root, 'Visium')
+input_dir <- file.path(data_root, 'Visium', 'inputs')
+raw_dir <- file.path(data_root, 'Visium', 'raw')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+figure_dir <- file.path(outdir, 'figures')
+xenium_dir <- file.path(output_root, 'Xenium', 'data')
+for (path in c(outdir, intermediate_dir, result_dir, figure_dir)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+future::plan('sequential')
+
+samples <- read.csv(file.path(input_dir, 'samples.csv'), colClasses = 'character')
+
+source(file.path(code_root, 'Visium', 'helpers.R'), local = TRUE)
+
+```
+
+## Registered Xenium pseudospots
+
+```{r load_registration_inputs}
+
+library(RANN)
+registration_root <- file.path(data_root, 'Registration', 'Visium')
+spots <- read.csv(file.path(intermediate_dir, 'spot_metadata.csv'))
+analysis <- readRDS(file.path(intermediate_dir, 'visium_analysis.rds'))
+xenium <- readRDS(file.path(xenium_dir, 'final_annotation.rds'))
+
+```
+
+```{r prepare_registration_files}
+
+manifest <- samples
+manifest$visium_file <- file.path(registration_root, manifest$sample, 'visium_cells.csv')
+manifest$xenium_file <- file.path(registration_root, manifest$sample, 'xenium_cells.csv')
+
+```
+
+```{r match_cells_to_spots}
+
+pseudospots <- lapply(seq_len(nrow(manifest)), function(i) {
+    row <- manifest[i, ]
+    barcodes <- sub(".*_", "", spots$spot[spots$sample == row$sample & spots$QC_750_keep])
+    v <- read.csv(row$visium_file)
+    v <- v[v$barcode %in% barcodes, ]
+    x <- read.csv(row$xenium_file)
+    x$main_lineage <- xenium$main_lineage[match(x$cell, rownames(xenium))]
+    x <- x[!is.na(x$main_lineage), ]
+    coordinates <- as.matrix(v[c("x_registered", "y_registered")])
+    spacing <- RANN::nn2(coordinates, coordinates, k = 2)$nn.dists[, 2]
+    radius <- 27.5/(100/median(spacing))
+    neighbors <- RANN::nn2(as.matrix(x[c("x_registered", "y_registered")]), coordinates, searchtype = "radius", 
+        k = min(3000, nrow(x)), radius = radius)
+    matches <- lapply(seq_len(nrow(v)), function(j) {
+        index <- neighbors$nn.idx[j, ]
+        index <- index[index > 0]
+        if (!length(index)) 
+            return(NULL)
+        data.frame(barcode = v$barcode[j], cell = x$cell[index], main_lineage = x$main_lineage[index])
+    })
+    matches <- bind_rows(matches)
+    counts <- matches %>% count(barcode, main_lineage)
+    list(sample = row$sample, patient = row$patient, radius = radius, matches = matches, lineage_counts = counts, 
+        coords = v)
+})
+names(pseudospots) <- manifest$sample
+saveRDS(pseudospots, file.path(intermediate_dir, 'registered_pseudospots.rds'))
+
+```
+
+## Visium melanoma-weight threshold
+
+```{r prepare_threshold_validation}
+
+library(patchwork)
+library(tidyr)
+weights <- read.csv(file.path(result_dir, 'Visium_cell2location_weights.csv'))
+
+```
+
+```{r quantify_registered_melanoma}
+
+reference <- lapply(pseudospots, function(section) {
+    section$matches %>% group_by(barcode) %>% summarise(n_registered = n(), n_melanoma = sum(main_lineage == "Melanoma"), 
+        .groups = "drop") %>% mutate(spot = paste0(section$sample, "_", barcode), patient = section$patient, xenium_tumour = n_melanoma >= 
+        5 & n_melanoma/n_registered >= 0.25)
+})
+reference <- bind_rows(reference)
+validation <- inner_join(weights %>% select(spot, Melanoma), reference, by = 'spot')
+
+```
+
+```{r evaluate_melanoma_thresholds}
+
+grid <- lapply(seq(0, 1, 0.0025), function(threshold) {
+    call <- validation$Melanoma >= threshold
+    truth <- validation$xenium_tumour
+    TP <- sum(call & truth)
+    FP <- sum(call & !truth)
+    FN <- sum(!call & truth)
+    TN <- sum(!call & !truth)
+    precision <- TP/(TP + FP)
+    recall <- TP/(TP + FN)
+    denominator <- sqrt(as.numeric(TP + FP) * as.numeric(TP + FN) * as.numeric(TN + FP) * as.numeric(TN + FN))
+    mcc <- ifelse(denominator == 0, NA_real_, (TP * TN - FP * FN)/denominator)
+    data.frame(threshold = threshold, TP, FP, FN, TN, precision, recall, F1 = 2 * precision * recall/(precision + 
+        recall), MCC = mcc)
+})
+grid <- bind_rows(grid)
+write.csv(grid, file.path(result_dir, "Supplementary_Figure_13B_thresholds.csv"), row.names = FALSE)
+
+```
+
+```{r plot_threshold_performance}
+
+plot_data <- grid %>% select(threshold, F1, MCC) %>% pivot_longer(c(F1, MCC), names_to = 'metric', values_to = 'value')
+plot <- ggplot(plot_data, aes(threshold, value, color = metric)) + geom_vline(xintercept = 0.20, linetype = 'dashed', color = 'grey25') + geom_line(linewidth = 0.7, na.rm = TRUE) + scale_color_manual(values = c(F1 = '#0072B2', MCC = '#D55E00')) + labs(x = 'Melanoma-weight threshold', y = 'Performance score', color = NULL) + theme_classic(base_size = 9) + theme(legend.position = 'top')
+save_panel(plot, 'Supplementary_Figure_13B_cell2location_threshold.pdf', 4, 3)
+
+```
+
+## Registered Xenium pseudospot expression
+
+```{r load_pseudospot_counts}
+
+pre <- assemble_section_expression(analysis$sections)
+xenium <- readRDS(file.path(xenium_dir, 'counts_qc.rds'))
+genes <- intersect(rownames(xenium$counts), rownames(pre))
+all_cells <- unique(unlist(lapply(pseudospots, function(section) section$matches$cell)))
+counts <- xenium$counts[genes, all_cells, drop = FALSE]
+rm(xenium)
+gc()
+
+```
+
+```{r aggregate_pseudospot_expression}
+
+aggregated <- lapply(pseudospots, function(section) {
+    matches <- section$matches
+    membership <- factor(matches$barcode, levels = unique(matches$barcode))
+    design <- Matrix::sparse.model.matrix(~0 + membership)
+    colnames(design) <- levels(membership)
+    raw <- counts[, matches$cell, drop = FALSE] %*% design
+    library_size <- Matrix::colSums(raw)
+    normalised <- raw
+    normalised@x <- log1p(normalised@x/rep.int(library_size, diff(normalised@p)) * 10000)
+    list(sample = section$sample, patient = section$patient, data = normalised, coords = section$coords, n_cells = table(matches$barcode))
+})
+saveRDS(aggregated, file.path(intermediate_dir, 'pseudospot_expression.rds'))
+
+```
+
+## Visium integration diagnostics
+
+```{r load_integration_diagnostics}
+
+library(ggrepel)
+objects <- analysis$sections
+features <- analysis$integration$features
+integrated <- analysis$integration
+
+```
+
+```{r embed_unintegrated_spots}
+
+expression <- pre[features, , drop = FALSE]
+metadata <- data.frame(spot = colnames(expression), sample = unlist(lapply(objects, function(seu) seu$sample), use.names = FALSE))
+scaled <- t(scale(t(as.matrix(expression))))
+pca <- RunPCA(object = scaled, npcs = 30, seed.use = 20260802, verbose = FALSE)
+umap <- RunUMAP(Embeddings(pca), n.components = 2, n.neighbors = 30, min.dist = 0.30, metric = 'cosine', seed.use = 20260802, verbose = FALSE)
+
+```
+
+```{r test_batch_mixing}
+
+kbet <- function(embedding, batch) {
+    set.seed(20260830)
+    kBET::kBET(df = embedding[, 1:5], batch = batch, k0 = 30, testSize = 766, do.pca = FALSE, heuristic = FALSE, 
+        n_repeat = 100, alpha = 0.05, adapt = TRUE, plot = FALSE, verbose = FALSE)
+}
+before <- kbet(Embeddings(pca), metadata$sample)
+after <- kbet(Embeddings(integrated$reductions[['pca_rpca']]), integrated$metadata$sample)
+summary <- data.frame(stage = c('SCTnorm', 'RPCA'), acceptance_rate = 1 - c(before$summary['mean', 'kBET.observed'], after$summary['mean', 'kBET.observed']))
+write.csv(summary, file.path(result_dir, "Supplementary_Figure_12F_kBET.csv"), row.names = FALSE)
+
+```
+
+```{r plot_integration_embeddings}
+
+patient_colors <- setNames(c('#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#56B4E9'), samples$patient)
+embedding_plot <- function(coordinates, sample) {
+    data <- data.frame(UMAP_1 = coordinates[, 1], UMAP_2 = coordinates[, 2], patient = samples$patient[match(sample, 
+        samples$sample)])
+    centers <- data %>% group_by(patient) %>% summarise(UMAP_1 = median(UMAP_1), UMAP_2 = median(UMAP_2), .groups = "drop")
+    ggplot(data, aes(UMAP_1, UMAP_2, color = patient)) + ggrastr::geom_point_rast(size = 0.55, alpha = 0.7, stroke = 0, raster.dpi = 300) + geom_label_repel(data = centers, 
+        aes(label = patient), color = "black", fill = scales::alpha("white", 0.9), size = 3.2, linewidth = 0.2, 
+        seed = 123, show.legend = FALSE) + scale_color_manual(values = patient_colors) + labs(x = "UMAP 1", y = "UMAP 2") + 
+        theme_classic(base_size = 11) + theme(axis.text = element_blank(), axis.ticks = element_blank(), legend.position = "none")
+}
+save_panel(embedding_plot(Embeddings(umap), metadata$sample), 'Supplementary_Figure_12D_before_integration.pdf', 4, 4)
+save_panel(embedding_plot(Embeddings(integrated$reductions[['umap_rpca']]), integrated$metadata$sample), 'Supplementary_Figure_12E_after_integration.pdf', 4, 4)
+
+```
+
+```{r plot_batch_acceptance}
+
+plot <- ggplot(summary, aes(stage, acceptance_rate, fill = stage)) + geom_col(width = 0.65) + geom_text(aes(label = scales::percent(acceptance_rate, accuracy = 0.1)), vjust = -0.5, size = 3.5) + scale_fill_manual(values = c(RPCA = '#BDBDBD', SCTnorm = '#D55E00')) + labs(x = NULL, y = 'kBET acceptance rate') + theme_classic(base_size = 11) + theme(legend.position = 'none')
+save_panel(plot, 'Supplementary_Figure_12F_kBET.pdf', 4, 4)
+
+```
+
+## Visium quality-control maps
+
+```{r prepare_quality_maps}
+
+sid <- 'thinmme003_1'
+patient <- samples$patient[match(sid, samples$sample)]
+seu <- Load10X_Spatial(file.path(raw_dir, sid), assay = 'Spatial', slice = 'slice1', filter.matrix = TRUE, to.upper = FALSE)
+
+```
+
+```{r plot_quality_maps}
+
+seu$nCount_Spatial_asinh <- asinh(seu$nCount_Spatial)
+seu$nFeature_Spatial_asinh <- asinh(seu$nFeature_Spatial)
+seu$QC_750_keep <- seu$nFeature_Spatial >= 750
+plot <- SpatialFeaturePlot(seu, features = c('nCount_Spatial_asinh', 'nFeature_Spatial_asinh', 'QC_750_keep'), ncol = 3, image.alpha = 0.4, pt.size.factor = 4) +
+  plot_annotation(title = patient, theme = theme(plot.title = element_text(hjust = 0, face = 'bold')))
+save_panel(plot, 'Supplementary_Figure_12ABC_quality_control.pdf', 12, 5)
+
+```
+
+## Visium spatial imputation check
+
+```{r load_imputation_comparisons}
+
+library(spdep)
+post <- analysis$magic
+
+```
+
+```{r test_spatial_agreement}
+
+results <- lapply(names(aggregated), function(sid) {
+    section <- aggregated[[sid]]
+    keep <- colnames(section$data)
+    keep <- keep[section$n_cells[keep] >= 1]
+    spots <- intersect(paste0(sid, "_", keep), colnames(pre))
+    keep <- sub(paste0(sid, "_"), "", spots)
+    coordinates <- section$coords[match(keep, section$coords$barcode), c("x_registered", "y_registered")]
+    neighbors <- spdep::knearneigh(as.matrix(coordinates), k = 6)
+    weights <- spdep::nb2listw(spdep::knn2nb(neighbors), style = "W")
+    rows <- lapply(rownames(section$data), function(gene) {
+        x <- as.numeric(section$data[gene, keep])
+        a <- as.numeric(pre[gene, spots])
+        b <- as.numeric(post[gene, spots])
+        data.frame(sample = sid, gene = gene, n_spots = length(x), pearson_pre = suppressWarnings(cor(x, a, use = "pairwise.complete.obs")), 
+            pearson_post = suppressWarnings(cor(x, b, use = "pairwise.complete.obs")), lee_pre = tryCatch(spdep::lee(x, 
+                a, weights, n = length(x))$L, error = function(e) NA_real_), lee_post = tryCatch(spdep::lee(x, 
+                b, weights, n = length(x))$L, error = function(e) NA_real_))
+    })
+    bind_rows(rows)
+})
+results <- bind_rows(results) %>% mutate(delta = lee_post - lee_pre)
+
+```
+
+```{r export_imputation_agreement}
+
+results$patient <- samples$patient[match(results$sample, samples$sample)]
+write.csv(results, file.path(result_dir, "Visium_spatial_imputation_agreement.csv"), row.names = FALSE)
+
+```
+
+```{r plot_imputation_agreement}
+
+limits <- range(c(results$lee_pre, results$lee_post), na.rm = TRUE)
+mean_pre <- mean(results$lee_pre, na.rm = TRUE)
+mean_post <- mean(results$lee_post, na.rm = TRUE)
+scatter <- ggplot(results, aes(lee_pre, lee_post, color = delta)) + geom_abline(slope = 1, intercept = 0, linetype = 'dashed') + geom_point(size = 1, alpha = 0.8, stroke = 0, na.rm = TRUE) + scale_color_gradient2(low = '#2166AC', mid = '#E8E8E8', high = '#B2182B', midpoint = 0, limits = c(-0.2, 0.2), oob = scales::squish) + scale_x_continuous(limits = limits) + scale_y_continuous(limits = limits) + coord_equal() + theme_classic(base_size = 11) + theme(legend.position = 'none') + labs(x = "Lee's L (pre)", y = "Lee's L (post)")
+top <- ggplot(results, aes(lee_pre)) + geom_density(fill = scales::alpha('#BDBDBD', 0.65), color = '#5F5F5F', linewidth = 0.5, na.rm = TRUE) + geom_vline(xintercept = mean_pre, linetype = 'dashed') + annotate('text', x = mean_pre, y = Inf, label = sprintf('mean = %.3f', mean_pre), vjust = 1.5, hjust = -0.1, size = 3) + scale_x_continuous(limits = limits) + theme_void()
+right <- ggplot(results, aes(lee_post)) + geom_density(fill = scales::alpha('#BDBDBD', 0.65), color = '#5F5F5F', linewidth = 0.5, na.rm = TRUE) + geom_vline(xintercept = mean_post, linetype = 'dashed') + annotate('text', x = mean_post, y = 2.5, label = sprintf('mean = %.3f', mean_post), vjust = -0.5, hjust = -0.1, size = 3, angle = -90) + scale_x_continuous(limits = limits) + coord_flip() + theme_void()
+plot <- top + plot_spacer() + scatter + right + plot_layout(ncol = 2, widths = c(4, 1), heights = c(1, 4))
+save_panel(plot, 'Supplementary_Figure_12G_spatial_imputation.pdf', 5, 5)
+
+```
+
+## Visium imputation examples
+
+```{r prepare_imputation_examples}
+
+section <- objects[[sid]]
+pseudospots <- aggregated[[sid]]
+section <- subset(section, cells = intersect(colnames(section), paste0(sid, '_', colnames(pseudospots$data))))
+plot_inputs <- list()
+
+```
+
+```{r plot_imputation_examples}
+
+for (gene in c("CD3G", "PTTG1")) {
+    xenium_values <- setNames(as.numeric(pseudospots$data[gene, ]), paste0(sid, "_", colnames(pseudospots$data)))
+    values <- list(Xenium = xenium_values[colnames(section)], Pre_MAGIC = pre[gene, colnames(section)], Post_MAGIC = post[gene, 
+        colnames(section)])
+    for (modality in names(values)) {
+        scale <- quantile(values[[modality]], 0.999)
+        section[[modality]] <- setNames(pmin(1, as.numeric(values[[modality]])/scale), colnames(section))
+        plot_inputs[[paste(gene, modality)]] <- data.frame(spot = colnames(section), patient = patient, gene = gene, 
+            modality = modality, scaled_expression = section[[modality]][, 1])
+    }
+    panels <- SpatialFeaturePlot(section, features = names(values), pt.size.factor = 6, image.alpha = 0.4, combine = FALSE)
+    panels <- lapply(panels, function(plot) plot + scale_fill_viridis_c(limits = c(0, 1)) + theme(plot.title = element_blank(), legend.position = "none"))
+    panel <- wrap_plots(panels, nrow = 1) + plot_annotation(title = gene, subtitle = patient, theme = theme(plot.title = element_text(hjust = 0.5, 
+        face = "bold", size = 14), plot.subtitle = element_text(hjust = 0.5, size = 10)))
+    letter <- if (gene == "CD3G") 
+        "H"
+    else "I"
+    save_panel(panel, paste0("Supplementary_Figure_12", letter, "_", gene, ".pdf"), 5, 4)
+}
+write.csv(bind_rows(plot_inputs), file.path(result_dir, "Supplementary_Figure_12HI_plot_inputs.csv"), row.names = FALSE)
+
+```
+
+## Visium angiogenesis-associated genes
+
+```{r select_angiogenesis_genes}
+
+assignment <- analysis$metaprograms$assignment
+trajectory <- analysis$trajectory
+trajectory <- trajectory[match(assignment$spot, trajectory$spot), ]
+genes <- c('NRP1', 'FGFR1', 'VEGFA', 'POSTN', 'COL3A1', 'COL5A2')
+expression <- as.matrix(assemble_section_expression(objects, genes = genes, spots = trajectory$spot))
+z <- t(scale(t(expression)))
+groups <- list(MES = assignment$mesenchymal_invasive, 'Nevus-like' = assignment$nevus_like_senescence)
+
+```
+
+```{r summarize_angiogenesis_expression}
+
+profiles <- lapply(names(groups), function(group) {
+    member <- groups[[group]]
+    data.frame(gene = genes, group = group, n = sum(member), mean_z = rowMeans(z[, member, drop = FALSE]), mean_SCT = rowMeans(expression[, 
+        member, drop = FALSE]), fraction_detected = rowMeans(expression[, member, drop = FALSE] > 0))
+})
+profiles <- bind_rows(profiles)
+write.csv(profiles, file.path(result_dir, "Visium_Discussion_angiogenesis_gene_profiles.csv"), row.names = FALSE)
+
+```
+
+## Visium table composition inputs
+
+```{r prepare_composition_summary}
+
+weights <- weights[match(trajectory$spot, weights$spot), ]
+counts <- spots$nCount[match(trajectory$spot, spots$spot)]
+programs <- names(analysis$metaprograms$signatures)
+lineages <- c('Melanoma', 'Lymphocyte', 'Myeloid', 'Endothelial', 'Fibroblast', 'Epithelial', 'Stroma')
+
+```
+
+```{r export_composition_summary}
+
+summarise_group <- function(member, group, type) {
+    data.frame(group_type = type, group = group, n_spots = sum(member), median_nCount = median(counts[member]), 
+        as.data.frame(t(colMeans(weights[member, lineages, drop = FALSE]))), check.names = FALSE)
+}
+rows <- lapply(programs, function(program) summarise_group(assignment[[program]], program, 'Metaprogram'))
+classes <- c('Shared Trunk', 'Lineage 1', 'Lineage 2')
+rows <- c(rows, lapply(classes, function(class) summarise_group(trajectory$pt_class == class, class, 'Trajectory class')))
+composition <- bind_rows(rows)
+write.csv(composition, file.path(result_dir, "Visium_biological_group_composition.csv"), row.names = FALSE)
+
+```
+

@@ -1,0 +1,456 @@
+---
+title: "Visium gene pathway analysis"
+author: "Asier Antoranz"
+output:
+  html_document:
+    df_print: paged
+---
+
+Compares gene expression and Hallmark pathway activity between metaprogrammes and models their changes along pseudotime using tradeSeq and generalised additive models.
+
+**Inputs:** Processed Visium objects, metaprogramme assignments and trajectories from notebook 01, plus Hallmark gene sets, pathway display settings and tradeSeq settings in `paper_data/Visium/inputs`.
+
+**Outputs:** Expression inputs, pathway scores and fitted models in `data/`; comparison tests and fitted curves in `results/`; pathway maps/heatmaps and gene/pathway trajectory plots in `figures/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+code_root <- 'path_to_code'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(data.table)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(patchwork)
+
+outdir <- file.path(output_root, 'Visium')
+input_dir <- file.path(data_root, 'Visium', 'inputs')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+figure_dir <- file.path(outdir, 'figures')
+for (path in c(outdir, intermediate_dir, result_dir, figure_dir)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+future::plan('sequential')
+source(file.path(code_root, 'Visium', 'helpers.R'), local = TRUE)
+samples <- read.csv(file.path(input_dir, 'samples.csv'), colClasses = 'character')
+
+```
+
+## Visium gene and pathway inputs
+
+```{r load_analysis_inputs}
+
+analysis <- readRDS(file.path(intermediate_dir, 'visium_analysis.rds'))
+objects <- analysis$sections
+assignment <- analysis$metaprograms$assignment
+trajectory <- analysis$trajectory
+trajectory <- trajectory[match(assignment$spot, trajectory$spot), ]
+
+```
+
+```{r assemble_expression_matrices}
+
+common <- Reduce(intersect, lapply(objects, function(seu) rownames(seu[['SCT']])))
+expression <- assemble_section_expression(objects, genes = common, spots = trajectory$spot)
+counts <- assemble_section_expression(objects, assay = 'Spatial', layer = 'counts', genes = common, spots = trajectory$spot)
+counts <- counts[Matrix::rowMeans(counts > 0) >= 0.1, , drop = FALSE]
+
+```
+
+```{r prepare_lineage_weights}
+
+pseudotime <- as.matrix(trajectory[c('pt_route1', 'pt_route2')])
+weights <- cbind(as.numeric(trajectory$pt_class %in% c('Shared Trunk', 'Lineage 1')), as.numeric(trajectory$pt_class %in% c('Shared Trunk', 'Lineage 2')))
+rownames(pseudotime) <- rownames(weights) <- trajectory$spot
+colnames(pseudotime) <- colnames(weights) <- c('Lineage1', 'Lineage2')
+
+```
+
+```{r prepare_analysis_inputs}
+
+settings <- readRDS(file.path(input_dir, 'tradeSeq_settings.rds'))
+inputs <- list(expression = expression, counts = counts, pseudotime = pseudotime, cellWeights = weights, trajectory = trajectory, assignment = assignment, settings = settings)
+
+```
+
+## Visium gene comparisons
+
+```{r prepare_gene_comparisons}
+
+library(presto)
+corrected <- expression
+corrected@x <- expm1(corrected@x)
+
+```
+
+```{r gene_comparison_function}
+
+compare_genes <- function(member, name, type) {
+    labels <- factor(ifelse(member, "member", "other"), levels = c("other", "member"))
+    test <- presto::wilcoxauc(expression, labels, verbose = FALSE) %>% filter(group == "member")
+    mean_member <- Matrix::rowMeans(corrected[, member, drop = FALSE])
+    mean_other <- Matrix::rowMeans(corrected[, !member, drop = FALSE])
+    logfc <- log2((mean_member + 1)/(mean_other + 1))
+    test %>% transmute(gene = feature, comparison_type = type, comparison = name, avg_log2FC = logfc[feature], 
+        p_value = pval, FDR = padj, AUC = auc, pct_member = pct_in, pct_other = pct_out, n_member = sum(member), 
+        n_other = sum(!member))
+}
+
+```
+
+```{r compare_gene_expression}
+
+programs <- names(analysis$metaprograms$signatures)
+classes <- c('Shared Trunk', 'Lineage 1', 'Lineage 2')
+program_tests <- lapply(programs, function(program) compare_genes(inputs$assignment[[program]], program, 'Metaprogram'))
+class_tests <- lapply(classes, function(class) compare_genes(inputs$trajectory$pt_class == class, class, 'Trajectory class'))
+results <- bind_rows(c(program_tests, class_tests)) %>% mutate(significant = !is.na(FDR) & FDR < 0.05 & abs(avg_log2FC) >= 0.5)
+
+```
+
+```{r export_gene_comparisons}
+
+connection <- gzfile(file.path(result_dir, 'Visium_gene_comparisons.csv.gz'), 'wt')
+write.csv(results, connection, row.names = FALSE)
+close(connection)
+
+```
+
+## Visium pathway scores
+
+```{r prepare_pathway_scoring}
+
+library(GSVA)
+library(BiocParallel)
+
+```
+
+```{r load_hallmark_signatures}
+
+definitions <- read.csv(file.path(input_dir, 'Hallmark_definitions.csv.gz'))
+gene_sets <- split(definitions$gene_symbol, definitions$gs_name)
+gene_sets <- lapply(gene_sets, function(genes) intersect(unique(genes), rownames(expression)))
+gene_sets <- gene_sets[lengths(gene_sets) >= 10 & lengths(gene_sets) <= 500]
+
+```
+
+```{r score_hallmark_pathways}
+
+parameter <- gsvaParam(exprData = expression, geneSets = gene_sets, minSize = 10, maxSize = 500, kcdf = 'Gaussian', sparse = inherits(expression, 'sparseMatrix'), checkNA = 'no', ondisk = 'no', verbose = FALSE)
+scores <- as.matrix(gsva(parameter, verbose = FALSE, BPPARAM = SerialParam()))
+scores <- scores[, inputs$trajectory$spot, drop = FALSE]
+
+```
+
+```{r save_pathway_scores}
+
+saveRDS(scores, file.path(intermediate_dir, 'pathway_scores.rds'))
+
+```
+
+```{r trajectory_plot_function}
+
+plot_trajectory_curves <- function(curves, kind) {
+  p <- ggplot(curves, aes(pseudotime, fitted_mean, colour = lineage)) +
+    geom_line(linewidth = 0.5) + facet_wrap(vars(.data[[kind]]), scales = 'free_y', ncol = 4) +
+    scale_colour_manual(values = c('Lineage 1' = '#E377C2', 'Lineage 2' = '#353C40')) +
+    theme_classic() + labs(x = 'Pseudotime', y = 'Fitted expression / pathway score', colour = NULL)
+  ggsave(file.path(figure_dir, if (kind == 'gene') 'Figure_4E_gene_trajectories.pdf' else 'Figure_4F_pathway_trajectories.pdf'), p, width = 9, height = if (kind == 'gene') 4 else 2.5)
+}
+
+```
+
+## Visium pathway comparisons
+
+```{r pathway_comparison_function}
+
+compare_pathways <- function(member, name, type) {
+    rows <- lapply(rownames(scores), function(pathway) {
+        a <- scores[pathway, member]
+        b <- scores[pathway, !member]
+        p <- suppressWarnings(wilcox.test(a, b, exact = FALSE)$p.value)
+        data.frame(comparison_type = type, comparison = name, n_member = sum(member), n_other = sum(!member), pathway = pathway, 
+            collection = "Hallmark", median_difference = median(a) - median(b), mean_difference = mean(a) - mean(b), 
+            p_value = p)
+    })
+    bind_rows(rows) %>% mutate(FDR = p.adjust(p_value, method = "BH"))
+}
+
+```
+
+```{r compare_pathway_scores}
+
+program_tests <- lapply(programs, function(program) compare_pathways(inputs$assignment[[program]], program, 'Metaprogram'))
+class_tests <- lapply(classes, function(class) compare_pathways(inputs$trajectory$pt_class == class, class, 'Trajectory class'))
+results <- bind_rows(c(program_tests, class_tests))
+
+```
+
+```{r export_pathway_comparisons}
+
+write.csv(results, file.path(result_dir, "Visium_pathway_comparisons.csv"), row.names = FALSE)
+
+```
+
+## Pathway differences between metaprograms in tissue
+
+```{r pathway_state_panels}
+
+withr::with_preserve_seed(local({
+  program_names <- names(analysis$metaprograms$signatures)
+  tests <- results
+
+  z <- t(scale(t(scores)))
+  means <- lapply(program_names, function(program) {
+      member <- assignment[[program]]
+      data.frame(pathway = rownames(z), metaprogram = program, mean_GSVA_zscore = rowMeans(z[, member, drop = FALSE]))
+  })
+  means <- bind_rows(means)
+
+  display <- read.csv(file.path(input_dir, 'display_pathways.csv'))
+  selected <- means[means$pathway %in% display[[1]], ]
+  tests <- tests %>% filter(comparison_type == 'Metaprogram') %>% select(pathway, metaprogram = comparison, FDR)
+  heatmap_data <- left_join(selected, tests, by = c('pathway', 'metaprogram'))
+  write.csv(heatmap_data, file.path(result_dir, "Figure_4C_pathway_heatmap.csv"), row.names = FALSE)
+
+  df <- heatmap_data
+  df$metaprogram <- factor(df$metaprogram, levels = c('epithelial_adjacent', 'early_developmental_stress', 'proliferation_cell_cycle', 'differentiated_melanocytic', 'ifn_associated_stress', 'nevus_like_senescence', 'mesenchymal_invasive'))
+  df$stars <- ifelse(df$FDR < 0.001, '***', ifelse(df$FDR < 0.01, '**', ifelse(df$FDR < 0.05, '*', '')))
+  p <- ggplot(df, aes(metaprogram, pathway, fill = mean_GSVA_zscore)) + geom_tile(colour = 'white') +
+    geom_text(aes(label = stars), size = 2) +
+    scale_fill_gradient2(low = '#2166AC', mid = 'white', high = '#B2182B', name = 'Mean GSVA z-score') +
+    theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(x = NULL, y = NULL)
+  ggsave(file.path(figure_dir, 'Figure_4C_pathway_heatmap.pdf'), p, width = 7, height = 7)
+
+  pathways <- c('HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION', 'HALLMARK_ANGIOGENESIS', 'HALLMARK_INFLAMMATORY_RESPONSE')
+  labels <- c('EMT', 'Angiogenesis', 'Inflammatory response')
+  panels <- list()
+
+  for (sid in c("thinmme003_1", "thinmme006_1")) {
+      patient <- samples$patient[match(sid, samples$sample)]
+      seu <- objects[[sid]]
+      for (i in seq_along(pathways)) {
+          values <- data.frame(spot = colnames(z), pathway_score = z[pathways[i], ])
+          seu <- assign_spot_meta(seu, values, "pathway_score")
+          panel <- SpatialFeaturePlot(seu, features = "pathway_score", pt.size.factor = 3, image.alpha = 0.35, combine = FALSE)[[1]] +
+            scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-3, 
+              3), oob = scales::squish, na.value = "grey75", breaks = c(-3, 0, 3), labels = c("-3 or less", "0", 
+              "3 or more"), name = "GSVA z-score") +
+            labs(title = labels[i], subtitle = patient) + theme_void(base_size = 11) + theme(plot.title = element_text(face = "bold", size = 11, hjust = 0.5), plot.subtitle = element_text(size = 10, 
+              hjust = 0.5), legend.position = "bottom")
+          panels[[paste(sid, pathways[i])]] <- panel + guides(fill = guide_colourbar(title.position = "top"))
+      }
+  }
+  panel <- wrap_plots(panels, ncol = 3, guides = 'collect') & theme(legend.position = 'bottom')
+  save_panel(panel, 'Figure_4D_spatial_pathways.pdf', 9, 7.5)
+}))
+
+```
+
+## Visium pathway trajectories
+
+```{r prepare_pathway_models}
+
+library(mgcv)
+trajectory <- inputs$trajectory
+trajectory$progression <- with(trajectory, ifelse(pt_class == 'Lineage 1', pt_route1, ifelse(pt_class == 'Lineage 2', pt_route2, pt_merged)))
+models <- list()
+tests <- list()
+
+```
+
+```{r fit_pathway_trajectories}
+
+for (pathway in sort(rownames(scores))) {
+    for (lineage in c("Lineage 1", "Lineage 2")) {
+        selected <- trajectory$pt_class %in% c("Shared Trunk", lineage)
+        data <- data.frame(GSVA_score = scores[pathway, selected], progression = trajectory$progression[selected])
+        model <- mgcv::gam(GSVA_score ~ s(progression, bs = "cs", k = 5), data = data, method = "REML", family = gaussian())
+        key <- paste(pathway, lineage, sep = "::")
+        models[[key]] <- model
+        smooth <- summary(model)$s.table
+        bounds <- quantile(data$progression, c(0.025, 0.975), names = FALSE)
+        grid <- data.frame(progression = seq(bounds[1], bounds[2], length.out = 150))
+        amplitude <- diff(range(predict(model, newdata = grid, type = "response")))
+        pathway_sd <- sd(scores[pathway, ])
+        tests[[key]] <- data.frame(pathway = pathway, lineage = lineage, n_spots = nrow(data), edf = smooth[1, 
+            "edf"], association_p = smooth[1, ncol(smooth)], range_lower = bounds[1], range_upper = bounds[2], 
+            fitted_range = amplitude, pathway_sd = pathway_sd, standardized_range = amplitude/pathway_sd)
+    }
+}
+results <- bind_rows(tests) %>% mutate(association_FDR = p.adjust(association_p, 'BH'))
+
+```
+
+```{r export_pathway_models}
+
+saveRDS(models, file.path(intermediate_dir, 'pathway_models.rds'))
+write.csv(results, file.path(result_dir, "Visium_pathway_trajectory_tests.csv"), row.names = FALSE)
+
+```
+
+## Visium pathway trajectory panel
+
+```{r select_display_pathways}
+
+pathways <- c('HALLMARK_MYC_TARGETS_V1', 'HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION', 'HALLMARK_INFLAMMATORY_RESPONSE', 'HALLMARK_COMPLEMENT')
+
+```
+
+```{r predict_pathway_curves}
+
+curves <- list()
+for (pathway in pathways) {
+    for (lineage in c("Lineage 1", "Lineage 2")) {
+        key <- paste(pathway, lineage, sep = "::")
+        model <- models[[key]]
+        grid <- data.frame(progression = seq(min(model$model$progression), max(model$model$progression), length.out = 150))
+        curves[[key]] <- data.frame(pathway = pathway, lineage = lineage, pseudotime = grid$progression, fitted_mean = as.numeric(predict(model, 
+            newdata = grid, type = "response")))
+    }
+}
+pathway_curves <- bind_rows(curves)
+write.csv(pathway_curves, file.path(result_dir, "Figure_4F_pathway_curves.csv"), row.names = FALSE)
+
+```
+
+```{r plot_pathway_trajectories}
+
+plot_trajectory_curves(pathway_curves, 'pathway')
+
+```
+
+## Visium gene trajectories
+
+```{r load_gene_model_libraries}
+
+library(tradeSeq)
+library(SingleCellExperiment)
+
+```
+
+```{r fit_gene_trajectories}
+
+set.seed(inputs$settings$seed)
+fit <- tradeSeq::fitGAM(counts = as.matrix(inputs$counts), pseudotime = inputs$pseudotime, cellWeights = inputs$cellWeights, nknots = inputs$settings$nknots, verbose = FALSE, parallel = FALSE)
+saveRDS(fit, file.path(intermediate_dir, 'gene_models.rds'))
+
+```
+
+## Visium gene trajectory tests
+
+```{r association_test_helpers}
+
+association_basis <- function(contrast, expected_rank) {
+    decomposition <- svd(contrast)
+    basis <- decomposition$u[, seq_len(expected_rank), drop = FALSE]
+    basis
+}
+association_wald <- function(beta, covariance, basis) {
+    variance <- crossprod(basis, covariance %*% basis)
+    variance <- (variance + t(variance))/2
+    effect <- crossprod(basis, beta)
+    statistic <- as.numeric(crossprod(effect, solve(variance, effect)))
+    df <- ncol(basis)
+    c(waldStat = statistic, df = df, pvalue = pchisq(statistic, df, lower.tail = FALSE), log_pvalue = pchisq(statistic, 
+        df, lower.tail = FALSE, log.p = TRUE))
+}
+parameters <- rowData(fit)$tradeSeq
+beta <- as.matrix(parameters$beta[[1]])
+
+```
+
+```{r extract_association_contrasts}
+
+.visium_contrasts <- list()
+trace("waldTestFC", where = asNamespace("tradeSeq"), tracer = quote({
+    .visium_contrasts[[length(.visium_contrasts) + 1]] <<- L
+}), print = FALSE)
+tryCatch(invisible(associationTest(fit[1, ], lineages = TRUE, nPoints = 12, contrastType = 'start', l2fc = 0, inverse = 'Chol')), finally = untrace('waldTestFC', where = asNamespace('tradeSeq')))
+names(.visium_contrasts) <- c('global', 'L1', 'L2')
+bases <- lapply(names(.visium_contrasts), function(name) association_basis(.visium_contrasts[[name]], if (name == 'global') 10L else 5L))
+names(bases) <- names(.visium_contrasts)
+
+```
+
+```{r test_gene_associations}
+
+association <- lapply(names(bases), function(name) {
+    values <- t(vapply(seq_len(nrow(fit)), function(i) association_wald(beta[i, ], parameters$Sigma[[i]], bases[[name]]), 
+        numeric(4)))
+    data.frame(gene = rownames(fit), test = name, values)
+})
+
+```
+
+```{r test_lineage_patterns}
+
+pattern <- patternTest(fit, nPoints = 12, l2fc = 0, eigenThresh = 0.01)
+pattern <- pattern[match(rownames(fit), rownames(pattern)), ]
+pattern_results <- data.frame(gene = rownames(fit), test = 'pattern', waldStat = pattern$waldStat, df = pattern$df, pvalue = pchisq(pattern$waldStat, pattern$df, lower.tail = FALSE), log_pvalue = pchisq(pattern$waldStat, pattern$df, lower.tail = FALSE, log.p = TRUE))
+results <- bind_rows(c(association, list(pattern_results))) %>% group_by(test) %>% mutate(FDR = p.adjust(pvalue, 'BH')) %>% ungroup()
+
+```
+
+```{r export_gene_tests}
+
+connection <- gzfile(file.path(result_dir, 'Visium_gene_trajectory_tests.csv.gz'), 'wt')
+write.csv(results, connection, row.names = FALSE)
+close(connection)
+
+```
+
+## Visium gene trajectory panel
+
+```{r prepare_gene_predictions}
+
+predict_design <- get('predictGAM', envir = asNamespace('tradeSeq'))
+design <- colData(fit)$tradeSeq$X
+model_data <- colData(fit)$tradeSeq$dm
+pseudotime <- as.matrix(model_data[c('t1', 't2')])
+genes <- c('CCL18', 'C3', 'C1QC', 'CXCL12', 'TFAP2B', 'STK32A', 'TRPM1', 'MLANA')
+
+```
+
+```{r predict_gene_curves}
+
+offset <- median(model_data[, 2])
+curves <- list()
+for (lineage in 1:2) {
+    times <- model_data[[paste0("t", lineage)]][model_data[[paste0("l", lineage)]] == 1]
+    grid <- seq(quantile(times, 0.025), quantile(times, 0.975), length.out = 201)
+    data <- model_data[rep(1, length(grid)), , drop = FALSE]
+    data$U <- 1
+    data[, 2] <- offset
+    data$l1 <- as.integer(lineage == 1)
+    data$l2 <- as.integer(lineage == 2)
+    data$t1 <- data$t2 <- grid
+    prediction <- predict_design(design, data, pseudotime)
+    means <- exp(beta[match(genes, rownames(fit)), , drop = FALSE] %*% t(prediction) + offset)
+    for (i in seq_along(genes)) curves[[length(curves) + 1]] <- data.frame(gene = genes[i], lineage = paste0("Lineage ", 
+        lineage), pseudotime = grid, fitted_mean = means[i, ], reference_offset = offset)
+}
+gene_curves <- bind_rows(curves)
+
+```
+
+```{r export_gene_curves}
+
+write.csv(gene_curves, file.path(result_dir, "Figure_4E_gene_curves.csv"), row.names = FALSE)
+
+```
+
+```{r plot_gene_trajectories}
+
+plot_trajectory_curves(gene_curves, 'gene')
+
+```
+

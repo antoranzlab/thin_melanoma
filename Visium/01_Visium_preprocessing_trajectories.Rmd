@@ -1,0 +1,631 @@
+---
+title: "Visium preprocessing trajectories"
+author: "Asier Antoranz"
+output:
+  html_document:
+    df_print: paged
+---
+
+Filters, normalises, integrates and imputes Visium expression, scores melanoma metaprogrammes and projects melanoma-enriched spots onto the Xenium trajectories.
+
+**Inputs:** Visium count matrices and spatial images in `paper_data/Visium/raw`; cell2location weights, signatures and projection settings in `paper_data/Visium/inputs`; Xenium models and annotations from notebooks 02 and 04.
+
+**Outputs:** The final `data/visium_analysis.rds` contains section objects, integration reductions, MAGIC expression, metaprogramme scores/memberships and trajectories. SCT and MAGIC checkpoints are retained for the costly steps; summary tables are exported to `results/` and `data/`, with spatial, composition and projection panels in `figures/`.
+
+```{r setup, include=FALSE}
+
+# Set these root folders before running the notebook.
+data_root <- 'path_to_input'
+output_root <- 'path_to_output'
+code_root <- 'path_to_code'
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE)
+
+```
+
+```{r load_libraries}
+
+library(tidyverse)
+library(data.table)
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(patchwork)
+
+outdir <- file.path(output_root, 'Visium')
+input_dir <- file.path(data_root, 'Visium', 'inputs')
+raw_dir <- file.path(data_root, 'Visium', 'raw')
+intermediate_dir <- file.path(outdir, 'data')
+result_dir <- file.path(outdir, 'results')
+figure_dir <- file.path(outdir, 'figures')
+xenium_dir <- file.path(output_root, 'Xenium', 'data')
+source(file.path(code_root, 'Xenium', 'helpers.R'), local = TRUE)
+for (path in c(outdir, intermediate_dir, result_dir, figure_dir)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+future::plan('sequential')
+
+samples <- read.csv(file.path(input_dir, 'samples.csv'), colClasses = 'character')
+
+source(file.path(code_root, 'Visium', 'helpers.R'), local = TRUE)
+
+```
+
+```{r spot_identity_and_projection_helpers}
+
+patient_from_spot <- function(spot) {
+  sample <- sub('_[^_]+$', '', spot)
+  patient <- samples$patient[match(sample, samples$sample)]
+  if (anyNA(patient)) stop('Unknown Visium sample: ', paste(unique(sample[is.na(patient)]), collapse = ', '))
+  patient
+}
+
+nearest_on_skeleton <- function(points, skeleton) {
+    start <- skeleton[-nrow(skeleton), , drop = FALSE]
+    delta <- skeleton[-1, , drop = FALSE] - start
+    length2 <- rowSums(delta^2)
+    distance <- rep(Inf, nrow(points))
+    projected <- matrix(0, nrow(points), 2)
+    for (j in seq_len(nrow(start))) {
+        fraction <- rowSums(sweep(points, 2, start[j, ], "-") * matrix(delta[j, ], nrow(points), 2, byrow = TRUE))/length2[j]
+        fraction <- pmin(pmax(fraction, 0), 1)
+        candidate <- sweep(outer(fraction, delta[j, ]), 2, start[j, ], "+")
+        current <- sqrt(rowSums((points - candidate)^2))
+        update <- current < distance
+        distance[update] <- current[update]
+        projected[update, ] <- candidate[update, ]
+    }
+    data.frame(pt1_line = projected[, 1], pt2_line = projected[, 2])
+}
+
+```
+
+```{r composition_plot_function}
+
+patient_colors <- setNames(c('#D55E00', '#E69F00', '#009E73', '#56B4E9', '#0072B2', '#CC79A7'), c('thinmme008', 'thinmme004', 'thinmme003', 'thinmme006', 'thinmme005', 'thinmme007'))
+
+comparison_plot <- function(data, x, y, facet) {
+    ggplot(data, aes(.data[[x]], .data[[y]])) + geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey45") + 
+        geom_point(aes(color = patient), size = 2) + ggpubr::stat_cor(method = "spearman", r.accuracy = 0.01, p.accuracy = 0.001, 
+        size = 2.3, label.x.npc = "left", label.y.npc = "top") + facet_wrap(as.formula(paste("~", facet)), scales = "free", 
+        nrow = 1) + scale_color_manual(values = patient_colors) + labs(x = "Xenium fraction", y = "Visium fraction", 
+        color = NULL) + theme_bw(base_size = 8) + theme(legend.position = "bottom", strip.text = element_text(size = 7))
+}
+
+```
+
+## Visium inputs and patient identities
+
+```{r import_spot_metadata}
+
+spots <- lapply(samples$sample, function(sid) {
+    counts <- Read10X_h5(file.path(raw_dir, sid, "filtered_feature_bc_matrix.h5"))
+    data.frame(spot = paste(sid, colnames(counts), sep = "_"), sample = sid, nCount = Matrix::colSums(counts), 
+        nFeature = Matrix::colSums(counts > 0))
+})
+spots <- bind_rows(spots)
+spots$patient <- patient_from_spot(spots$spot)
+spots$QC_750_keep <- spots$nFeature >= 750
+
+```
+
+```{r align_lineage_weights}
+
+weights <- readRDS(file.path(input_dir, 'lineage_weights.rds'))
+melanoma <- weights$spot[weights$melanoma_analysis]
+spots$melanoma_analysis <- spots$spot %in% melanoma
+
+```
+
+```{r export_spot_dictionary}
+
+write.csv(spots, file.path(intermediate_dir, "spot_metadata.csv"), row.names = FALSE)
+
+```
+
+## Visium normalization
+
+```{r normalization_memory}
+
+options(future.globals.maxSize = 8 * 1024^3)
+
+```
+
+```{r create_spatial_objects}
+
+objects <- lapply(samples$sample, function(sid) {
+    info <- samples[match(sid, samples$sample), ]
+    seu <- Load10X_Spatial(file.path(raw_dir, sid), assay = "Spatial", slice = "slice1", filter.matrix = TRUE, 
+        to.upper = FALSE)
+    seu$sample <- sid
+    seu$patient <- info$patient
+    seu$pair <- info$pair
+    seu$met_status <- ifelse(info$outcome == "M+", "met", "nmet")
+    subset(seu, cells = colnames(seu)[seu$nFeature_Spatial >= 750])
+})
+names(objects) <- samples$sample
+
+```
+
+```{r select_integration_features}
+
+ranked_objects <- lapply(objects, function(seu) {
+    DefaultAssay(seu) <- "Spatial"
+    seu <- NormalizeData(seu, verbose = FALSE)
+    FindVariableFeatures(seu, nfeatures = 3000, verbose = FALSE)
+})
+eligible <- Reduce(intersect, lapply(ranked_objects, function(seu) rownames(seu)[Matrix::rowSums(LayerData(seu[['Spatial']], layer = 'counts') > 0) >= 5]))
+ranked <- SelectIntegrationFeatures(ranked_objects, nfeatures = min(10000, length(eligible)), assay = rep('Spatial', length(objects)), verbose = FALSE)
+features <- head(ranked[ranked %in% eligible], 3000)
+
+```
+
+```{r normalize_sct}
+
+objects <- lapply(ranked_objects, function(seu) {
+    print(paste0("Normalizing ", unique(seu$sample)))
+    seu <- SCTransform(seu, assay = "Spatial", new.assay.name = "SCT", vst.flavor = "v2", method = "glmGamPoi", 
+        residual.features = features, variable.features.n = 3000, return.only.var.genes = TRUE, conserve.memory = TRUE, 
+        verbose = FALSE, seed.use = 20260802)
+    VariableFeatures(seu[["SCT"]]) <- features
+    seu
+})
+rm(ranked_objects)
+
+```
+
+## Visium RPCA integration
+
+```{r assign_unique_spot_names}
+
+for (sid in names(objects)) objects[[sid]] <- RenameCells(objects[[sid]], add.cell.id = sid)
+spot_ids <- unlist(lapply(objects, colnames), use.names = FALSE)
+saveRDS(list(sections = objects, features = features), file.path(intermediate_dir, 'visium_sct_checkpoint.rds'))
+
+```
+
+```{r integrate_rpca}
+
+prepared <- PrepSCTIntegration(objects, anchor.features = features, verbose = FALSE)
+prepared <- lapply(prepared, function(seu) RunPCA(seu, assay = 'SCT', features = features, npcs = 30, reduction.name = 'pca', seed.use = 42, verbose = FALSE))
+anchors <- FindIntegrationAnchors(prepared, normalization.method = 'SCT', anchor.features = features, reduction = 'rpca', dims = 1:30, k.anchor = 5, verbose = FALSE)
+integrated <- IntegrateData(anchors, normalization.method = 'SCT', dims = 1:30, new.assay.name = 'integratedRPCA', verbose = FALSE)
+
+```
+
+```{r embed_integrated_spots}
+
+DefaultAssay(integrated) <- 'integratedRPCA'
+integrated <- RunPCA(integrated, features = features, npcs = 30, reduction.name = 'pca_rpca', reduction.key = 'rPC_', seed.use = 42, verbose = FALSE)
+integrated <- RunUMAP(integrated, reduction = 'pca_rpca', dims = 1:30, n.components = 2, n.neighbors = 30, min.dist = 0.30, metric = 'cosine', reduction.name = 'umap_rpca', reduction.key = 'rUMAP_', seed.use = 20260802, verbose = FALSE)
+integration <- list(features = features, reductions = integrated@reductions, metadata = integrated[[]])
+rm(prepared, anchors)
+
+```
+
+## Visium MAGIC imputation
+
+```{r configure_magic}
+
+library(reticulate)
+use_condaenv('r_reticulate_env', required = TRUE)
+
+```
+
+```{r assemble_expression}
+
+expression <- assemble_section_expression(objects)
+embedding <- Embeddings(integrated, 'pca_rpca')[, 1:30]
+expression <- expression[, rownames(embedding), drop = FALSE]
+expression_t <- t(as.matrix(expression))
+rm(integrated)
+
+```
+
+```{r impute_magic}
+
+np <- import('numpy', convert = FALSE)
+graphtools <- import('graphtools', convert = FALSE)
+magic <- import('magic', convert = FALSE)
+graph <- graphtools$Graph(np$array(embedding), knn = 5L, decay = 1L, n_pca = NULL, random_state = 20260828L)
+model <- magic$MAGIC(knn = 5L, decay = 1L, t = 3L, n_pca = NULL, random_state = 20260828L, verbose = 0L)
+expression_python <- np$array(expression_t)
+model$fit(expression_python, graph = graph)
+imputed <- t(py_to_r(model$transform(X = expression_python, genes = 'all_genes')))
+rm(expression_python, expression_t)
+dimnames(imputed) <- dimnames(expression)
+saveRDS(list(expression = imputed, integration = integration), file.path(intermediate_dir, 'visium_magic_checkpoint.rds'))
+
+```
+
+## Visium cell2location results
+
+```{r load_celltype_weights}
+
+weights <- read.csv(file.path(input_dir, 'cell2location_weights.csv'))
+lineages <- c('Melanoma', 'Epithelial', 'Fibroblast', 'Lymphocyte', 'Myeloid', 'Endothelial', 'Stroma')
+
+```
+
+```{r assign_celltype_weights}
+
+weights$patient <- patient_from_spot(weights$spot)
+weights$melanoma_analysis <- weights$Melanoma >= 0.20
+
+```
+
+```{r export_celltype_weights}
+
+write.csv(weights, file.path(result_dir, "Visium_cell2location_weights.csv"), row.names = FALSE)
+write.csv(weights[weights$melanoma_analysis, c("spot", "sample", "patient")], file.path(intermediate_dir, "analysis_melanoma_spots.csv"), 
+    row.names = FALSE)
+
+```
+
+## Spatial cell composition and melanoma domain
+
+```{r spatial_celltype_maps}
+
+withr::with_preserve_seed(local({
+  lineages <- c('Melanoma', 'Lymphocyte', 'Myeloid', 'Endothelial', 'Fibroblast', 'Epithelial', 'Stroma')
+  sid <- 'thinmme003_1'
+  patient <- samples$patient[match(sid, samples$sample)]
+  seu <- objects[[sid]]
+  seu <- assign_spot_meta(seu, weights, lineages)
+  seu$melanoma_mask <- factor(ifelse(seu$Melanoma >= 0.20, 'Tumor', 'Not Tumor'), levels = c('Tumor', 'Not Tumor'))
+
+  panels <- SpatialFeaturePlot(seu, features = lineages, pt.size.factor = 3, image.alpha = 0.4, combine = FALSE)
+  panels <- Map(function(plot, lineage) {
+      plot + labs(title = lineage) + guides(fill = guide_colorbar(title = NULL, direction = "horizontal", ticks = FALSE)) + theme_void(base_size = 10) + theme(plot.title = element_text(size = 10.5, face = "bold", hjust = 0.5, margin = margin(b = 4)), legend.position = "bottom", 
+              legend.text = element_text(size = 7.5))
+  }, panels, lineages)
+
+  mask <- SpatialDimPlot(seu, group.by = 'melanoma_mask', pt.size.factor = 3, image.alpha = 0.4, cols = c('Not Tumor' = 'gray87', 'Tumor' = '#B2182B')) +
+    guides(fill = guide_legend(direction = 'horizontal', nrow = 1, override.aes = list(size = 3))) + labs(title = 'Melanoma mask (>= 0.2)', fill = NULL) + theme_void(base_size = 10) + theme(plot.title = element_text(size = 9, face = "bold", hjust = 0.5), legend.position = "bottom", legend.text = element_text(size = 7))
+  panel <- wrap_plots(c(panels, list(mask)), ncol = 4, byrow = TRUE) + plot_annotation(title = patient)
+  save_panel(panel, 'Supplementary_Figure_13A_cell2location.pdf', 6, 4.3)
+}))
+
+```
+
+## Visium metaprogram scores
+
+```{r select_melanoma_spots}
+
+programs <- c('differentiated_melanocytic', 'epithelial_adjacent', 'mesenchymal_invasive', 'proliferation_cell_cycle', 'early_developmental_stress', 'nevus_like_senescence', 'ifn_associated_stress')
+melanoma_spots <- weights$spot[as.logical(weights$melanoma_analysis)]
+
+```
+
+```{r score_metaprogrammes}
+
+signatures <- readRDS(file.path(input_dir, 'metaprogrammes.rds'))
+expression <- imputed[, melanoma_spots, drop = FALSE]
+score_obj <- CreateSeuratObject(counts = expression)
+score_obj <- SetAssayData(score_obj, layer = 'data', new.data = expression)
+score_obj <- AddModuleScore(score_obj, features = signatures[programs], name = 'MP_', ctrl = 100, nbin = 24, seed = 20260805)
+scores <- data.frame(spot = colnames(score_obj), score_obj[[]][paste0('MP_', 1:7)], check.names = FALSE)
+names(scores)[2:8] <- programs
+scores$sample <- sub('_[^_]+$', '', scores$spot)
+scores$patient <- patient_from_spot(scores$spot)
+rm(expression, score_obj)
+
+```
+
+```{r load_xenium_reference}
+
+xenium_path <- file.path(xenium_dir, 'final_annotation.rds')
+xenium_annotations <- readRDS(xenium_path)
+xenium <- xenium_annotations[xenium_annotations$main_lineage == 'Melanoma', c('patient', 'melanoma_mp', programs)]
+xenium$sample <- paste0(xenium$patient, '_1')
+
+```
+
+```{r calibrate_metaprogram_scores}
+
+quantile_map <- function(x, reference) {
+    ranks <- (rank(x, ties.method = "average") - 0.5)/length(x)
+    as.numeric(quantile(reference, probs = ranks, na.rm = TRUE, type = 7))
+}
+calibrated <- scores
+for (sid in unique(scores$sample)) {
+    selected <- scores$sample == sid
+    reference <- xenium[xenium$sample == sid, ]
+    for (program in programs) calibrated[selected, program] <- quantile_map(scores[selected, program], reference[[program]])
+}
+write.csv(calibrated, file.path(result_dir, "Visium_calibrated_metaprogram_scores.csv"), row.names = FALSE)
+
+```
+
+## Spatial metaprogram scores
+
+```{r spatial_metaprogram_maps}
+
+withr::with_preserve_seed(local({
+  score_colors <- c('#3B4CC0', '#39BEB1', '#F4E55C', '#E85D3F', '#9E0142')
+  program_names <- names(signatures[programs])
+  metaprogram_scores <- calibrated
+  selected <- c('differentiated_melanocytic', 'epithelial_adjacent', 'mesenchymal_invasive', 'nevus_like_senescence')
+  labels <- c('Melanocytic', 'Epithelial-adjacent', 'Mesenchymal-invasive', 'Nevus-like')
+
+  for (sid in c("thinmme003_1", "thinmme006_1")) {
+      patient <- samples$patient[match(sid, samples$sample)]
+      seu <- objects[[sid]]
+      section_scores <- metaprogram_scores[startsWith(metaprogram_scores$spot, paste0(sid, "_")), ]
+      seu <- assign_spot_meta(seu, section_scores, program_names)
+      limit <- quantile(abs(unlist(section_scores[program_names])), 0.99, na.rm = TRUE)
+      panels <- SpatialFeaturePlot(seu, features = selected, pt.size.factor = 3, image.alpha = 0.4, combine = FALSE)
+      panels <- Map(function(plot, label) {
+          plot + labs(title = label, fill = NULL) + scale_fill_gradientn(colors = score_colors, values = scales::rescale(c(-limit, 
+              -limit/2, 0, limit/2, limit)), limits = c(-limit, limit), oob = scales::squish) + guides(fill = guide_colorbar(direction = "horizontal")) + theme_void(base_size = 10) + 
+              theme(plot.title = element_text(size = 8, face = "bold", hjust = 0.5))
+      }, panels, labels)
+      panel <- wrap_plots(panels, nrow = 1, guides = "collect") + plot_annotation(title = patient)
+      panel <- panel & theme(legend.position = "bottom", legend.text = element_text(size = 8))
+      save_panel(panel, paste0("Figure_4A_", patient, "_metaprograms.pdf"), 8, 3)
+  }
+}))
+
+```
+
+## Visium metaprogram membership
+
+```{r compare_membership_composition}
+
+xenium_composition <- xenium %>% count(sample, program = melanoma_mp, name = 'N') %>% complete(sample, program = programs, fill = list(N = 0)) %>% group_by(sample) %>% mutate(xenium_fraction = N / sum(N)) %>% ungroup()
+calibrated_matrix <- as.matrix(calibrated[programs])
+compute_composition <- function(threshold) {
+    membership <- as.data.frame(calibrated_matrix >= threshold)
+    membership$sample <- calibrated$sample
+    composition <- membership %>% pivot_longer(all_of(programs), names_to = "program", values_to = "member") %>% 
+        group_by(sample, program) %>% summarise(N = sum(member), .groups = "drop") %>%
+      group_by(sample) %>% mutate(visium_fraction = N/sum(N)) %>% ungroup()
+    inner_join(composition, xenium_composition, by = c("sample", "program"), suffix = c("_visium", "_xenium"))
+}
+
+```
+
+```{r select_membership_threshold}
+
+grid <- lapply(seq(-0.4, 0.4, 0.05), function(threshold) {
+    composition <- compute_composition(threshold)
+    per_patient <- composition %>% group_by(sample) %>% summarise(rho = cor(visium_fraction, xenium_fraction, method = "spearman"), 
+        .groups = "drop")
+    data.frame(threshold = threshold, median_spearman = median(per_patient$rho, na.rm = TRUE), mae = mean(abs(composition$visium_fraction - 
+        composition$xenium_fraction)))
+})
+grid <- bind_rows(grid) %>% mutate(joint_score = (median_spearman + 1 - mae) / 2)
+best <- grid %>% filter(joint_score == max(joint_score, na.rm = TRUE))
+set.seed(20260805)
+best <- best[sample.int(nrow(best), 1), ]
+write.csv(grid, file.path(result_dir, "Visium_membership_thresholds.csv"), row.names = FALSE)
+
+```
+
+```{r plot_membership_threshold}
+
+withr::with_preserve_seed(local({
+  thresholds <- grid
+  selected <- best$threshold
+
+  thresholds <- thresholds %>% mutate(composition_agreement = 1 - mae) %>% pivot_longer(c(median_spearman, composition_agreement), names_to = 'metric', values_to = 'value')
+  thresholds$metric <- factor(thresholds$metric, levels = c('median_spearman', 'composition_agreement'), labels = c('Median Spearman rho', 'Composition agreement (1 - MAE)'))
+  plot <- ggplot(thresholds, aes(threshold, value, color = metric)) + geom_vline(xintercept = selected, linetype = 'dashed', color = 'grey25') + geom_line(linewidth = 0.7) + geom_point(size = 1) + scale_color_manual(values = c('#0072B2', '#D55E00')) + scale_x_continuous(breaks = seq(-0.4, 0.4, 0.2)) + scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) + labs(x = 'Membership threshold (calibrated score)', y = 'Composition recovery', color = NULL) + theme_classic(base_size = 9) + theme(legend.position = 'top', legend.text = element_text(size = 7)) + guides(color = guide_legend(nrow = 2))
+  save_panel(plot, 'Supplementary_Figure_13C_membership_threshold.pdf', 4, 3)
+}))
+
+```
+
+```{r assign_metaprogram_membership}
+
+member <- as.data.frame(calibrated_matrix >= best$threshold)
+assignment <- cbind(calibrated[c('spot', 'sample', 'patient')], member)
+composition <- compute_composition(best$threshold)
+composition$patient <- samples$patient[match(composition$sample, samples$sample)]
+membership <- list(assignment = assignment, threshold = best$threshold, composition = composition)
+write.csv(assignment, file.path(result_dir, "Visium_metaprogram_membership.csv"), row.names = FALSE)
+write.csv(composition, file.path(result_dir, "Visium_metaprogram_composition.csv"), row.names = FALSE)
+
+```
+
+## Metaprogram composition and cellular context
+
+```{r plot_metaprogram_composition}
+
+withr::with_preserve_seed(local({
+  programs <- membership$composition
+  programs$program <- factor(programs$program, levels = c('differentiated_melanocytic', 'early_developmental_stress', 'epithelial_adjacent', 'ifn_associated_stress', 'mesenchymal_invasive', 'nevus_like_senescence', 'proliferation_cell_cycle'), labels = c('Melanocytic', 'Developmental', 'Epithelial-adjacent', 'IFN-associated', 'MES', 'Nevus-like', 'Proliferative'))
+  save_panel(comparison_plot(programs, 'xenium_fraction', 'visium_fraction', 'program'), 'Supplementary_Figure_13D_metaprogram_composition.pdf', 10, 2.5)
+}))
+
+```
+
+```{r metaprogram_cell_composition}
+
+withr::with_preserve_seed(local({
+  program_names <- names(signatures[programs])
+  lineages <- c('Melanoma', 'Lymphocyte', 'Myeloid', 'Endothelial', 'Fibroblast', 'Epithelial', 'Stroma')
+  weights <- weights[match(assignment$spot, weights$spot), ]
+
+  composition <- lapply(program_names, function(program) {
+      member <- assignment[[program]]
+      data.frame(metaprogram = program, lineage = lineages, percent = 100 * colMeans(weights[member, lineages, drop = FALSE]))
+  })
+  composition <- bind_rows(composition)
+  write.csv(composition, file.path(result_dir, "Supplementary_Figure_13G_cell_composition.csv"), row.names = FALSE)
+
+  program_order <- c('epithelial_adjacent', 'early_developmental_stress', 'proliferation_cell_cycle', 'differentiated_melanocytic', 'ifn_associated_stress', 'nevus_like_senescence', 'mesenchymal_invasive')
+  program_labels <- c('Epithelial-adjacent', 'Developmental', 'Proliferative', 'Melanocytic', 'IFN-associated', 'Nevus-like', 'MES')
+  composition$metaprogram <- factor(composition$metaprogram, levels = program_order, labels = program_labels)
+  composition$lineage <- factor(composition$lineage, levels = rev(lineages))
+  plot <- ggplot(composition, aes(metaprogram, lineage, fill = percent)) + geom_tile(color = 'white', linewidth = 0.2) + geom_text(aes(label = sprintf('%.1f', percent)), size = 2) + scale_fill_gradient(low = 'white', high = '#3182BD', name = 'Mean relative weight (%)') + labs(x = NULL, y = NULL) + theme_minimal(base_size = 8) + theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1), legend.position = 'bottom')
+  save_panel(plot, 'Supplementary_Figure_13G_cell_composition.pdf', 4.8, 3)
+}))
+
+```
+
+## Visium trajectory projection
+
+```{r trajectory_projection_helpers}
+
+library(destiny)
+library(slingshot)
+features <- setdiff(programs, 'proliferation_cell_cycle')
+
+```
+
+```{r prepare_trajectory_projection}
+
+parameters <- read.csv(file.path(input_dir, 'xenium_score_scaling.csv'))
+center <- setNames(parameters$tmp_mean, parameters$melanoma_mp)[features]
+scale_sd <- setNames(parameters$tmp_sd, parameters$melanoma_mp)[features]
+scaled <- scale(as.matrix(calibrated[features]), center = center, scale = scale_sd)
+scaled[scaled > 3] <- 3
+scaled[scaled < -3] <- -3
+rownames(scaled) <- calibrated$spot
+melanoma <- readRDS(file.path(xenium_dir, 'melanoma_analysis.rds'))
+dm <- melanoma@misc$trajectory_models$diffusion_map
+fit <- melanoma@misc$trajectory_models$slingshot
+training <- trajectory_training_view(melanoma)
+rm(melanoma)
+order <- colnames(get('data', envir = dm@data_env))
+
+```
+
+```{r project_spot_trajectories}
+
+coordinates <- destiny::dm_predict(dm, scaled[, order, drop = FALSE])[, 1:3, drop = FALSE]
+coordinates <- sweep(coordinates, 2, training$signs, '*')
+colnames(coordinates) <- paste0('DC', 1:3)
+projected <- slingshot::predict(fit, newdata = as.data.frame(coordinates))
+pt <- slingPseudotime(projected, na = FALSE)
+weights <- slingCurveWeights(projected, as.probs = FALSE)
+trajectory <- data.frame(spot = calibrated$spot, pt_route1 = pt[, 1], pt_route2 = pt[, 2], w1 = weights[, 1], w2 = weights[, 2])
+
+```
+
+```{r align_shared_trunk}
+
+xenium <- xenium_annotations %>% filter(main_lineage == 'Melanoma') %>% transmute(pt_route1 = pt_route1_raw, pt_route2 = pt_route2_raw, w1, w2, pt_merged = (pt_route1_raw + pt_route2_raw) / 2)
+skeleton <- make_centerline(xenium %>% filter(w1 + w2 >= 1.5), 'pt_merged')
+nearest <- nearest_on_skeleton(as.matrix(trajectory[c('pt_route1', 'pt_route2')]), as.matrix(skeleton[c('pt_route1_s', 'pt_route2_s')]))
+trajectory$pt_route2 <- trajectory$pt_route2 - (nearest$pt2_line - nearest$pt1_line)
+trajectory <- trajectory %>% mutate(pt_merged = (pt_route1 + pt_route2) / 2, pt_class = case_when(w1 + w2 >= 1.5 ~ 'Shared Trunk', w2 < w1 ~ 'Lineage 1', w1 < w2 ~ 'Lineage 2', TRUE ~ 'Shared Trunk'))
+
+```
+
+```{r fit_trajectory_centrelines}
+
+skeleton <- bind_rows(make_centerline(trajectory, 'pt_merged', 'Shared Trunk', 15, 10, 0.25), make_centerline(trajectory, 'pt_route1', 'Lineage 1', 20, 10, 0.30), make_centerline(trajectory, 'pt_route2', 'Lineage 2', 20, 10, 0.30))
+trajectory$cl_dist <- NA_real_
+for (lineage in unique(trajectory$pt_class)) {
+    selected <- which(trajectory$pt_class == lineage)
+    s <- skeleton[skeleton$pt_class == lineage, ]
+    trajectory$cl_dist[selected] <- vapply(selected, function(i) sqrt(min((s$pt_route1_s - trajectory$pt_route1[i])^2 + 
+        (s$pt_route2_s - trajectory$pt_route2[i])^2)), numeric(1))
+}
+threshold <- mean(trajectory$cl_dist) + 3 * sd(trajectory$cl_dist)
+trajectory$cl_far <- trajectory$cl_dist > threshold
+trajectory$patient <- patient_from_spot(trajectory$spot)
+
+```
+
+## Visium trajectory correction
+
+```{r correct_projection_outliers}
+
+jitter <- readRDS(file.path(input_dir, 'visium_retained_jitter.rds'))
+selected <- which(trajectory$cl_far)
+index <- match(trajectory$spot[selected], jitter$spot)
+trajectory$pt_route1[selected] <- jitter$pt_route1[index]
+trajectory$pt_route2[selected] <- jitter$pt_route2[index]
+
+```
+
+```{r classify_trajectory_branches}
+
+fork <- 0.056
+trajectory <- trajectory %>% mutate(pt_merged = (pt_route1 + pt_route2) / 2, pt_class = case_when(pt_merged < fork ~ 'Shared Trunk', w2 < w1 ~ 'Lineage 1', w1 < w2 ~ 'Lineage 2', TRUE ~ 'Shared Trunk'), sample = sub('_[^_]+$', '', spot)) %>%
+  select(spot, patient, sample, pt_route1, pt_route2, w1, w2, pt_merged, pt_class)
+
+```
+
+```{r export_spot_trajectories}
+
+write.csv(trajectory, file.path(result_dir, "Visium_trajectory.csv"), row.names = FALSE)
+
+```
+
+## Corrected trajectories in tissue and relative to Xenium
+
+```{r spatial_trajectory_maps}
+
+withr::with_preserve_seed(local({
+  lineage_colors <- c('Lineage 1' = '#E377C2', 'Lineage 2' = '#353C40', 'Shared Trunk' = '#BDBDBD')
+  for (sid in c("thinmme003_1", "thinmme006_1")) {
+      patient <- samples$patient[match(sid, samples$sample)]
+      seu <- objects[[sid]]
+      seu <- assign_spot_meta(seu, trajectory, "pt_class")
+      seu$pt_class <- factor(seu$pt_class, levels = names(lineage_colors))
+      classes <- SpatialDimPlot(seu, group.by = "pt_class", pt.size.factor = 3, image.alpha = 0.4, cols = lineage_colors) +
+        guides(fill = guide_legend(nrow = 2)) + labs(title = patient, fill = NULL) + theme_void(base_size = 10) + 
+          theme(plot.title = element_text(size = 10, face = "bold", hjust = 0.5), legend.position = "bottom")
+      save_panel(classes, paste0("Figure_4B_", patient, "_trajectories.pdf"), 3, 3)
+  }
+}))
+
+```
+
+```{r compare_lineage_composition}
+
+withr::with_preserve_seed(local({
+  xenium <- xenium_annotations %>% filter(main_lineage == 'Melanoma') %>% transmute(sample = paste0(patient, '_1'), pt_class)
+  classes <- c('Shared Trunk', 'Lineage 1', 'Lineage 2')
+
+  composition <- function(data) {
+      data %>% filter(pt_class %in% classes) %>% dplyr::count(sample, pt_class) %>% complete(sample, pt_class = classes, 
+          fill = list(n = 0)) %>% group_by(sample) %>% mutate(fraction = n/sum(n)) %>% ungroup()
+  }
+  lineage <- inner_join(composition(trajectory), composition(xenium), by = c('sample', 'pt_class'), suffix = c('_visium', '_xenium'))
+  lineage$patient <- samples$patient[match(lineage$sample, samples$sample)]
+  write.csv(lineage, file.path(result_dir, "Visium_lineage_composition.csv"), row.names = FALSE)
+  lineage$pt_class <- factor(lineage$pt_class, levels = classes)
+  save_panel(comparison_plot(lineage, 'fraction_xenium', 'fraction_visium', 'pt_class'), 'Supplementary_Figure_13F_lineage_composition.pdf', 6, 2.5)
+}))
+
+```
+
+```{r plot_corrected_trajectory_projection}
+
+withr::with_preserve_seed(local({
+  lineage_colors <- c('Lineage 1' = '#E377C2', 'Lineage 2' = '#353C40', 'Shared Trunk' = '#BDBDBD')
+  program_names <- names(signatures[programs])
+  metaprogram_scores <- calibrated
+
+  index <- match(trajectory$spot, metaprogram_scores$spot)
+  trajectory$metaprogram <- program_names[max.col(as.matrix(metaprogram_scores[index, program_names]), ties.method = 'first')]
+  skeleton <- bind_rows(make_centerline(trajectory, 'pt_merged', 'Shared Trunk', 15, 10, 0.25), make_centerline(trajectory, 'pt_route1', 'Lineage 1', 20, 10, 0.30), make_centerline(trajectory, 'pt_route2', 'Lineage 2', 20, 10, 0.30))
+  centroids <- trajectory %>% group_by(metaprogram) %>% summarise(pt_route1 = median(pt_route1), pt_route2 = median(pt_route2), .groups = 'drop')
+  program_colors <- c(differentiated_melanocytic = 'brown', epithelial_adjacent = '#009E73', mesenchymal_invasive = 'pink', proliferation_cell_cycle = 'indianred', early_developmental_stress = 'goldenrod', nevus_like_senescence = '#D55E00', ifn_associated_stress = 'coral')
+  program_labels <- c(differentiated_melanocytic = 'Melanocytic', epithelial_adjacent = 'Epithelial-adjacent', mesenchymal_invasive = 'MES', proliferation_cell_cycle = 'Proliferative', early_developmental_stress = 'Developmental', nevus_like_senescence = 'Nevus-like', ifn_associated_stress = 'IFN-associated')
+
+  plot <- ggplot(trajectory, aes(pt_route1, pt_route2, color = metaprogram)) + ggrastr::geom_point_rast(alpha = 0.5, size = 1, raster.dpi = 300) + geom_path(data = skeleton, aes(pt_route1_s, pt_route2_s, color = pt_class), linewidth = 1, lineend = 'round') + geom_abline(slope = 1, intercept = 0, linetype = 'dashed', color = 'gray67') + geom_point(data = centroids, shape = 23, fill = 'white', size = 3) + scale_color_manual(values = c(program_colors, lineage_colors), labels = c(program_labels, setNames(names(lineage_colors), names(lineage_colors)))) + labs(x = 'Pseudotime Lineage 1', y = 'Pseudotime Lineage 2', color = NULL) + theme_bw(base_size = 9) + guides(color = guide_legend(override.aes = list(alpha = 1, size = 2)))
+  save_panel(plot, 'Supplementary_Figure_13E_trajectory_projection.pdf', 6, 3.5)
+}))
+
+```
+
+## Save the final Visium analysis
+
+```{r save_visium_analysis}
+
+analysis <- list(
+  sections = objects,
+  integration = integration,
+  magic = imputed,
+  metaprograms = list(raw = scores, calibrated = calibrated, signatures = signatures[programs],
+                     assignment = membership$assignment, threshold = membership$threshold,
+                     composition = membership$composition),
+  trajectory = trajectory
+)
+saveRDS(analysis, file.path(intermediate_dir, 'visium_analysis.rds'))
+
+```
